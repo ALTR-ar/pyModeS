@@ -80,3 +80,4 @@ venv/
 # Dump
 /dump
 *.csv
+*.json

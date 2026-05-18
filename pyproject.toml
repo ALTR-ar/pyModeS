@@ -35,6 +35,7 @@ modeslive = "pyModeS._v2_removed:modeslive_main"
 
 [project.optional-dependencies]
 tui = ["textual>=0.50"]
+web = ["fastapi>=0.111", "uvicorn[standard]>=0.29", "flask"]
 
 [project.urls]
 homepage = "https://mode-s.org"

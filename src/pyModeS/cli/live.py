@@ -79,6 +79,24 @@ def run(args: argparse.Namespace) -> int:
         # writes inside the alt-screen would corrupt the display.
         source = NetworkSource(host, port, on_detect=None, silent=True)
         return run_tui_app(args, pipe, source)
+    
+    # ── add this ──────────────────────────────────────────────────
+    if args.web:
+        try:
+            from pyModeS.cli.web_live import run_web_app
+        except ImportError:
+            print(
+                "modes live: --web requires the web extra.\n"
+                "Install: pip install 'pyModeS[web]'",
+                file=sys.stderr,
+            )
+            return 3
+        source = NetworkSource(host, port, on_detect=None, silent=True)
+        return run_web_app(
+            args, pipe, source,
+            bind_host="0.0.0.0",
+            bind_port=args.web_port,
+        )
 
     # Non-TUI sink pipeline
     sink = _build_sink(args)

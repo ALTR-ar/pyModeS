@@ -23,7 +23,7 @@ import os
 import csv
 import json
 import sys
-from datetime import datetime
+from datetime import datetime,timezone
 from typing import IO, Protocol
 
 from pyModeS.message import Decoded
@@ -66,28 +66,39 @@ class JsonLinesSink:
         if self._owns_stream:
             self._stream.close()
             
-SKIP_FIELDS = {"df", "raw_msg", "bds"}
+SKIP_FIELDS = {}#{"df", "raw_msg"}
 
 class CsvSink:
     def __init__(self, path: str, ac_filter: str | None = None) -> None:
         self._ac_filter = ac_filter.upper() if ac_filter is not None else None
-        base = path.removesuffix(".csv")
+    
         ts_now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        os.makedirs("dump", exist_ok=True)
-        
-        if self._ac_filter is not None:
-            base = os.path.join("dump", f"{ts_now}_{base}_{self._ac_filter}")
+    
+        # Split input path into directory + filename
+        input_dir = os.path.dirname(path)          # e.g. "/tst"
+        base_name = os.path.splitext(os.path.basename(path))[0]  # "tst2"
+    
+        # Mirror directory inside "dump"
+        output_dir = os.path.join("dump", input_dir.lstrip(os.sep))
+        os.makedirs(output_dir, exist_ok=True)
+    
+        # Build filename
+        if self._ac_filter:
+            file_base = f"{base_name}_{ts_now}_{self._ac_filter}"
         else:
-             base = os.path.join("dump", f"{ts_now}_{base}")
-            
-        self._fh_decoded = open(base + ".csv", "w", buffering=1, newline="")
-        self._fh_raw = open(base + "_raw.csv", "w", buffering=1, newline="")
+            file_base = f"{base_name}_{ts_now}"
+    
+        decoded_path = os.path.join(output_dir, file_base + ".csv")
+        raw_path = os.path.join(output_dir, file_base + "_raw.csv")
+    
+        self._fh_decoded = open(decoded_path, "w", buffering=1, newline="")
+        self._fh_raw = open(raw_path, "w", buffering=1, newline="")
 
         self._writer_decoded = csv.writer(self._fh_decoded, lineterminator="\n")
         self._writer_raw = csv.writer(self._fh_raw, lineterminator="\n")
 
-        self._writer_decoded.writerow(["timestamp", "icao", "field", "value"])
-        self._writer_raw.writerow(["timestamp", "icao", "df", "raw_msg"])
+        self._writer_decoded.writerow(["timestamp (UTC)", "icao", "field", "value"])
+        self._writer_raw.writerow(["timestamp (UTC)", "icao", "df", "raw_msg"])
 
         self._fh_decoded.flush()
         self._fh_raw.flush()
@@ -97,7 +108,7 @@ class CsvSink:
             return
 
         ts = decoded.get("timestamp", "")
-        ts_formatted = datetime.fromtimestamp(ts).strftime("%Y%m%d-%H:%M:%S.%f") if ts != "" else ""
+        ts_formatted = (datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y%m%d-%H:%M:%S.%f")if ts != "" else "")
         icao = decoded.get("icao", "")
 
         self._writer_raw.writerow([ts_formatted, icao, decoded.get("df", ""), decoded.get("raw_msg", "")])

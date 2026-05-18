@@ -46,6 +46,7 @@ def decode_bds05(payload: int, *, tc: int) -> dict[str, Any]:
     cpr_lon = payload & 0x1FFFF  # bits 39-55 (17 bits)
 
     altitude: int | None
+    altitude_source: str | None
     if 9 <= tc <= 18:
         # Barometric altitude: insert a zero M bit at position 6 of
         # the 13-bit altcode. Top 6 bits of AC (positions 0-5) shift
@@ -53,14 +54,18 @@ def decode_bds05(payload: int, *, tc: int) -> dict[str, Any]:
         # AC (positions 6-11) become altcode bits 7-12.
         altcode = ((ac >> 6) << 7) | (ac & 0x3F)
         altitude = altcode_to_altitude(altcode)
+        altitude_source = "barometric"
     elif 20 <= tc <= 22:
         # GNSS altitude: 12-bit integer meters converted to feet
         altitude = int(ac * 3.28084)
+        altitude_source = "gnss"
     else:
         altitude = None
+        altitude_source = None
 
     return {
         "altitude": altitude,
+        "altitude_source": altitude_source,
         "surveillance_status": ss,
         "nic_b": nic_b,
         "cpr_format": cpr_format,

@@ -40,6 +40,7 @@ _FULL_SCHEMA: dict[str, type | str] = {
     "bds_candidates": "list[str] | None",
     # Surveillance reply header (DF4/5/20/21)
     "altitude": "int | None",
+    "altitude_source": "str | None",
     "squawk": "str | None",
     "flight_status": "int | None",
     "flight_status_text": "str | None",
@@ -79,6 +80,8 @@ _FULL_SCHEMA: dict[str, type | str] = {
     "vr_source": "str | None",
     "geo_minus_baro": "int | None",
     "nac_v": "int | None",
+    "v_ew": "int | None",
+    "v_sn": "int | None",
     # BDS 1,0 data link capability
     "config": "int | None",
     "overlay_command_capability": "bool | None",
@@ -158,14 +161,48 @@ _FULL_SCHEMA: dict[str, type | str] = {
     "autopilot": "bool | None",
     "lnav_mode": "bool | None",
     "tcas_operational": "bool | None",
-    # BDS 6,5 operational status
-    "version": "int | None",
-    "capability_class": "int | None",
-    "operational_mode": "int | None",
-    "nic_supplement_a": "int | None",
-    "nac_p": "int | None",
-    "sil": "int | None",
-    "sil_supplement": "int | None",
-    "nic_baro": "int | None",
-    "hrd": "str | None",
+   # BDS 6,5 operational status
+    "version":                      "int | None",
+    "capability_class_raw":         "int | None",   # raw 16-bit CC word
+    "operational_mode_raw":         "int | None",   # raw 16-bit OM word
+
+    # Capability class — airborne (subtype 0)
+    "cc_acas":                      "bool | None",  # TCAS Resolution Advisory active
+    "cc_cdti":                      "bool | None",  # Cockpit Display of Traffic Information
+    "cc_arv":                       "bool | None",  # Air-Referenced Velocity Report Capability
+    "cc_ts":                        "bool | None",  # Target State Report Capability
+    "cc_tc":                        "int | None",   # Target Trajectory Change (0–3)
+
+    # Capability class — surface (subtype 1)
+    "cc_poe":                       "bool | None",  # Position Offset Applied
+    "cc_es1090":                    "bool | None",  # ADS-B 1090ES Receive Capability
+    "cc_b2_low":                    "bool | None",  # Class B2 Ground Vehicle < 70 W
+    "cc_uat_in":                    "bool | None",  # UAT Receive Capability
+    "cc_nac_v":                     "int | None",   # Navigation Accuracy Category – Velocity (0–7)
+    "cc_nic_c":                     "int | None",   # NIC Supplement used on the Surface (0–1)
+
+    # Operational mode — surface only (subtype 1)
+    "om_lw_codes":                  "int | None",   # Aircraft length/width code (0–15)
+
+    # Operational mode — shared (both subtypes, different bit offsets)
+    "om_tcas_ra_active":            "bool | None",
+    "om_ident_switch_active":       "bool | None",
+    "om_reserved_recv_atc_service": "bool | None",
+    "om_single_antenna_flag":       "bool | None",
+    "om_system_design_assurance":   "int | None",   # 2-bit (0–3)
+
+    # Operational mode — surface only (subtype 1)
+    "om_gps_antenna_offset":        "int | None",   # 8-bit encoded offset
+
+    # Version/subtype-dependent tail fields — present only when defined
+    "nic_s":                        "int | None",   # NIC supplement        (v1, airborne + surface)
+    "nic_a":                        "int | None",   # NIC supplement A      (v2, airborne + surface)
+    "nac_p":                        "int | None",   # Navigation Accuracy Category – Position
+    "baq":                          "int | None",   # Barometric Altitude Quality   (airborne v1 only)
+    "gva":                          "int | None",   # Geometry Vertical Accuracy    (airborne v2 only)
+    "sil":                          "int | None",   # Surveillance Integrity Level
+    "sil_s":                        "int | None",   # SIL supplement                (v2 only)
+    "bai":                          "int | None",   # Barometric Altitude Integrity / NIC_baro (airborne only)
+    "tah":                          "int | None",   # Track Angle or Heading        (surface only)
+    "hrd":                          "int | None",   # Heading Reference Direction   (0=true north, 1=magnetic)
 }

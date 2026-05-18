@@ -159,6 +159,19 @@ def _add_live_parser(
         action="store_true",
         help="Suppress stdout output (use with --dump-to).",
     )
+    live_p.add_argument(
+    "--web",
+    action="store_true",
+    help="launch a browser-based live table (requires pyModeS[web])",
+    )
+    live_p.add_argument(
+        "--web-port",
+        type=int,
+        default=8080,
+        metavar="PORT",
+        dest="web_port",
+        help="HTTP port for --web (default: 8080)",
+    )
 
 
 def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:

@@ -121,6 +121,8 @@ def _decode_ground_speed(payload: int, subtype: int) -> dict[str, Any]:
     return {
         "groundspeed": spd,
         "track": trk,
+        "v_ew": v_ew,
+        "v_sn": v_sn,
     }
 
 
