@@ -143,11 +143,14 @@ def _add_live_parser(
         help="Tee decoded JSON lines to a CSV file in addition to stdout.",
     )
     live_p.add_argument(
-        "--ac-filter",                          
-        metavar="ICAO",                         
+        "--ac-filter",
+        metavar="ICAO",
+        action="append",
         default=None,
-        help="Only write messages from this aircraft ICAO address to the CSV "
-             "(e.g. 4B1A2C). Requires --csv.",
+        dest="ac_filter",
+        help="Only write messages from this aircraft ICAO to the CSV "
+             "(e.g. 4B1A2C). Repeat to filter multiple ICAOs, each gets "
+             "its own CSV pair. Requires --csv.",
     )
     live_p.add_argument(
         "--tui",
@@ -167,10 +170,10 @@ def _add_live_parser(
     live_p.add_argument(
         "--web-port",
         type=int,
-        default=8080,
+        default=8088,
         metavar="PORT",
         dest="web_port",
-        help="HTTP port for --web (default: 8080)",
+        help="HTTP port for --web (default: 8088)",
     )
 
 

@@ -333,6 +333,7 @@ class NetworkSource:
             if not chunk:
                 raise OSError("connection closed by remote")
             wall_now = time.time()
+            mono_now = time.monotonic() #new
             self._buf += chunk
 
             # On first real data, verify the stream is beast format
@@ -372,8 +373,7 @@ class NetworkSource:
                 if dw >= _CALIB_MIN_DELTA_S and dm > 0:
                     self._rate_estimate = dm / dw
             self._prev_burst_wall = wall_now
-            self._prev_burst_mlat = burst_anchor_mlat
-
+            self._prev_burst_mlat = burst_anchor_mlat 
             rate = self._rate_estimate
             for mlat, hex_msg in frames:
                 if rate is not None and rate > 0:

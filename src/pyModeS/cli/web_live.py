@@ -79,6 +79,7 @@ _NUMERIC_FIELDS: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
+_SKIP_FIELDS = {"timestamp", "raw_msg", "df"}
 
 class _Store:
     """Thread-safe-enough store for aircraft time-series data.
@@ -89,31 +90,41 @@ class _Store:
     def __init__(self) -> None:
         self._data: dict[str, dict[str, Any]] = {}
 
+
+
     def ingest(self, icao: str, decoded: dict[str, Any], ts: float) -> None:
         state = self._data.get(icao)
         if state is None:
-            state = {"_last_seen": ts, "_callsign": ""}
+            state = {"_last_seen": ts, "_callsign": "", "_legends": {}}
             self._data[icao] = state
         state["_last_seen"] = ts
         cs = decoded.get("callsign")
         if cs:
             state["_callsign"] = cs
         for field, val in decoded.items():
-          if val is None:
-              continue
-            
-          # Try numeric first
-          try:
-              fval = float(val)
-              if field not in state:
-                  state[field] = deque(maxlen=_MAX_POINTS)
-              state[field].append((ts, fval))
-              continue
-          except (TypeError, ValueError):
-              pass
-            
-          # Non-numeric → store as "last value"
-          state[f"_str_{field}"] = val
+            if field in _SKIP_FIELDS or val is None:
+                continue
+            # numeric
+            try:
+                fval = float(val)
+                if field not in state:
+                    state[field] = deque(maxlen=_MAX_POINTS)
+                state[field].append((ts, fval))
+                continue
+            except (TypeError, ValueError):
+                pass
+            # string → encode as integer index
+            legends = state["_legends"]
+            if field not in legends:
+                legends[field] = {}
+            legend = legends[field]
+            sval = str(val)
+            if sval not in legend:
+                legend[sval] = len(legend)
+            ival = legend[sval]
+            if field not in state:
+                state[field] = deque(maxlen=_MAX_POINTS)
+            state[field].append((ts, float(ival)))
 
     def active_aircraft(self) -> list[dict[str, str]]:
         cutoff = time.time() - _EXPIRE_SECONDS
@@ -126,17 +137,26 @@ class _Store:
         return out
 
     def available_fields(self, icao: str) -> list[str]:
+        state = self._data.get(icao.lower()) or self._data.get(icao)
+        if state is None:
+            return []
+        return [
+            f for f, v in state.items()
+            if not f.startswith("_")
+            and f not in _SKIP_FIELDS
+            and isinstance(v, deque)
+            and len(v) > 0
+        ]
+    def field_legend(self, icao: str, field: str) -> dict[int, str]:
       state = self._data.get(icao.lower()) or self._data.get(icao)
       if state is None:
-          return []
-
-      return [
-          f for f, v in state.items()
-          if not f.startswith("_") and (
-              (not isinstance(v, str) and hasattr(v, "__len__") and len(v) > 0)
-              or isinstance(v, str)
-          )
-      ]
+          return {}
+      legends = state.get("_legends", {})
+      legend = legends.get(field)
+      if not legend:
+          return {}
+      # invert: value→label
+      return {v: k for k, v in legend.items()}
     
     def series(self, icao: str, field: str):
       state = self._data.get(icao.lower()) or self._data.get(icao)
@@ -531,29 +551,28 @@ async function doRefresh() {
 
   const now    = Date.now() / 1000;
   const cutoff = now - windowSec;
-
-  // Snapshot fields in stable order (insertion order of Set)
   const fields = [...checkedFields];
 
-  const traces = await Promise.all(fields.map(async (field, i) => {
-    const pts      = await api(`/api/series?icao=${selectedIcao}&field=${encodeURIComponent(field)}`);
-    const filtered = pts.filter(p => p.ts >= cutoff);
+  const results = await Promise.all(fields.map(f =>
+    api(`/api/series?icao=${selectedIcao}&field=${encodeURIComponent(f)}`)
+  ));
+
+  const traces = results.map((res, i) => {
+    const pts      = (res.points || []).filter(p => p.ts >= cutoff);
+    const legend   = res.legend || {};      // {"0":"EZY123","1":"BAW456"}
+    const hasLegend = Object.keys(legend).length > 0;
     const color    = COLORS[i % COLORS.length];
     return {
-      x:    filtered.map(p => new Date(p.ts * 1000)),
-      y:    filtered.map(p => p.value),
+      x:    pts.map(p => new Date(p.ts * 1000)),
+      y:    pts.map(p => p.value),
       mode: 'lines+markers',
-      name: field,
-      line: { color, width: 1.5 },
-      marker: {
-        symbol: 'cross',
-        size: 7,
-        color: 'rgba(0,0,0,0)',       // transparent fill — cross is open
-        line: { color, width: 1.5 },  // stroke gives the visible cross
-      },
-      yaxis: i === 0 ? 'y' : `y${i + 1}`,
+      name: fields[i],
+      line:   { color, width: 1.5 },
+      marker: { symbol: 'cross', size: 7, color: 'rgba(0,0,0,0)', line: { color, width: 1.5 } },
+      yaxis:  i === 0 ? 'y' : `y${i + 1}`,
+      _legend: hasLegend ? legend : null,   // stash for layout below
     };
-  }));
+  });
 
   const layout = {
     paper_bgcolor: 'transparent',
@@ -566,9 +585,10 @@ async function doRefresh() {
   };
 
   fields.forEach((field, i) => {
-    const key   = i === 0 ? 'yaxis' : `yaxis${i + 1}`;
-    const color = COLORS[i % COLORS.length];
-    layout[key] = {
+    const key    = i === 0 ? 'yaxis' : `yaxis${i + 1}`;
+    const color  = COLORS[i % COLORS.length];
+    const leg    = traces[i]._legend;
+    const yaxis  = {
       title:      { text: field, font: { size: 10, color } },
       gridcolor:  i === 0 ? '#1e2d42' : 'transparent',
       linecolor:  '#1e2d42',
@@ -580,17 +600,23 @@ async function doRefresh() {
       showgrid:   i === 0,
       zeroline:   false,
     };
+    if (leg) {
+      // replace numeric ticks with original string labels
+      const vals   = Object.keys(leg).map(Number).sort((a, b) => a - b);
+      yaxis.tickmode = 'array';
+      yaxis.tickvals = vals;
+      yaxis.ticktext = vals.map(v => leg[String(v)]);
+    }
+    layout[key] = yaxis;
+    delete traces[i]._legend;   // clean up before passing to Plotly
   });
 
   showPlot(true);
   Plotly.purge(plotlyDiv);
   Plotly.newPlot(plotlyDiv, traces, layout, {
-    responsive:     true,
-    displayModeBar: false,
-    scrollZoom:     true,
+    responsive: true, displayModeBar: false, scrollZoom: true,
   });
 }
-
 // ── Polling ───────────────────────────────────────────────
 winSelect.addEventListener('change', () => {
   windowSec = parseInt(winSelect.value);
@@ -617,7 +643,6 @@ showPlot(false);
 # ---------------------------------------------------------------------------
 # Flask server
 # ---------------------------------------------------------------------------
-
 def _make_flask_app(store: _Store, msg_counter: list[int]) -> Any:
     """Build and return a Flask WSGI app."""
     from flask import Flask, jsonify, request, Response
@@ -640,10 +665,14 @@ def _make_flask_app(store: _Store, msg_counter: list[int]) -> Any:
 
     @app.route("/api/series")
     def api_series() -> Response:
-        icao = request.args.get("icao", "")
-        field = request.args.get("field", "")
-        pts = store.series(icao, field)
-        return jsonify([{"ts": ts, "value": v} for ts, v in pts])
+        icao   = request.args.get("icao", "")
+        field  = request.args.get("field", "")
+        pts    = store.series(icao, field)
+        legend = store.field_legend(icao, field)
+        return jsonify({
+            "points": [{"ts": ts, "value": v} for ts, v in pts],
+            "legend": {str(k): v for k, v in legend.items()},
+        })
 
     @app.route("/api/status")
     def api_status() -> Response:
@@ -691,10 +720,14 @@ def _make_stdlib_handler(store: _Store, msg_counter: list[int]):
                 icao = qs.get("icao", [""])[0]
                 self._send_json({"fields": store.available_fields(icao)})
             elif path == "/api/series":
-                icao = qs.get("icao", [""])[0]
-                field = qs.get("field", [""])[0]
-                pts = store.series(icao, field)
-                self._send_json([{"ts": ts, "value": v} for ts, v in pts])
+                icao   = qs.get("icao", [""])[0]
+                field  = qs.get("field", [""])[0]
+                pts    = store.series(icao, field)
+                legend = store.field_legend(icao, field)
+                self._send_json({
+                    "points": [{"ts": ts, "value": v} for ts, v in pts],
+                    "legend": {str(k): v for k, v in legend.items()},
+                })
             elif path == "/api/status":
                 self._send_json({"msg_count": msg_counter[0]})
             else:
@@ -713,7 +746,7 @@ def run_web_app(
     pipe: PipeDecoder,
     source: NetworkSource,
     bind_host: str = "0.0.0.0",
-    bind_port: int = 8080,
+    bind_port: int = 8088,
 ) -> int:
     """Start the web dashboard and block until Ctrl-C.
 
@@ -746,6 +779,7 @@ def run_web_app(
             for hex_msg, ts in source:
                 if stop.is_set():
                     break
+                wall_ts = time.time()
                 try:
                     decoded = pipe.decode(hex_msg, timestamp=ts)
                 except Exception:
@@ -755,12 +789,12 @@ def run_web_app(
                 if csv_sink is not None:
                     with contextlib.suppress(Exception):
                         row = dict(decoded)
-                        row["timestamp"] = ts
+                        row["timestamp"] = wall_ts
                         row["raw_msg"] = hex_msg
                         csv_sink.write(row)
                 icao = decoded.get("icao")
                 if icao:
-                    store.ingest(icao, decoded, ts)
+                    store.ingest(icao, decoded, wall_ts)
         except UnsupportedStreamError as e:
             error_box.append(e)
         except Exception as e:

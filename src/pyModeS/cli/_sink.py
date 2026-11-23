@@ -18,7 +18,7 @@ The live main loop calls ``write`` for every decoded message and
 """
 
 from __future__ import annotations
-
+import time
 import os
 import csv
 import json
@@ -74,15 +74,17 @@ class CsvSink:
     
         ts_now = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-        # Split input path into directory + filename
-        input_dir = os.path.dirname(path)          # e.g. "/tst"
-        base_name = os.path.splitext(os.path.basename(path))[0]  # "tst2"
+        if path.endswith("/") or path.endswith(os.sep):
+            # Trailing slash → treat the whole path as the output folder
+            output_dir = os.path.abspath(path)
+            base_name = os.path.basename(output_dir.rstrip("/\\"))
+        else:
+            # No trailing slash → parent is the folder, basename is the filename prefix
+            output_dir = os.path.abspath(os.path.dirname(path))
+            base_name = os.path.basename(path)
     
-        # Mirror directory inside "dump"
-        output_dir = os.path.join("dump", input_dir.lstrip(os.sep))
         os.makedirs(output_dir, exist_ok=True)
     
-        # Build filename
         if self._ac_filter:
             file_base = f"{base_name}_{ts_now}_{self._ac_filter}"
         else:
@@ -107,8 +109,9 @@ class CsvSink:
         if self._ac_filter is not None and decoded.get("icao", "").upper() != self._ac_filter:
             return
 
-        ts = decoded.get("timestamp", "")
-        ts_formatted = (datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y%m%d-%H:%M:%S.%f")if ts != "" else "")
+        #ts = decoded.get("timestamp", "")
+        ts_formatted = datetime.now().strftime("%Y%m%d-%H:%M:%S.%f")
+        #ts_formatted = (datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y%m%d-%H:%M:%S.%f")if ts != "" else "")
         icao = decoded.get("icao", "")
 
         self._writer_raw.writerow([ts_formatted, icao, decoded.get("df", ""), decoded.get("raw_msg", "")])
@@ -147,6 +150,28 @@ class TeeSink:
             self._primary.close()
         finally:
             self._secondary.close()
+
+
+class MultiSink:
+    """Broadcasts every write to a list of sinks. Used for multiple --ac-filter."""
+
+    def __init__(self, sinks: list[Sink]) -> None:
+        self._sinks = sinks
+
+    def write(self, decoded: Decoded) -> None:
+        for sink in self._sinks:
+            sink.write(decoded)
+
+    def close(self) -> None:
+        first_exc = None
+        for sink in self._sinks:
+            try:
+                sink.close()
+            except Exception as e:
+                if first_exc is None:
+                    first_exc = e
+        if first_exc is not None:
+            raise first_exc
 
 
 class NullSink:

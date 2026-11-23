@@ -46,7 +46,7 @@ from textual.widgets import DataTable, Footer, Header, Input
 
 from pyModeS import PipeDecoder
 from pyModeS.cli._source import NetworkSource, UnsupportedStreamError
-from pyModeS.cli._sink import CsvSink
+from pyModeS.cli._sink import CsvSink, MultiSink
 
 # Fields the worker thread copies out of each decoded message into
 # the per-ICAO shared state dict. Covers every column across every
@@ -222,9 +222,11 @@ def _row_for_state(
         elif col == "sqwk":
             cells.append(str(state.get("squawk") or ""))
         elif col == "lat":
-            cells.append(_fmt_float(state.get("latitude"), 3))
+            v = state.get("latitude")
+            cells.append(_fmt_float(v, 3) if v is not None else ("..." if state.get("_cpr_seen") else ""))
         elif col == "lon":
-            cells.append(_fmt_float(state.get("longitude"), 3))
+            v = state.get("longitude")
+            cells.append(_fmt_float(v, 3) if v is not None else ("..." if state.get("_cpr_seen") else ""))
         elif col == "alt":
             cells.append(_fmt_int(state.get("altitude")))
         elif col == "sel":
@@ -349,7 +351,11 @@ class ModesLiveApp(App[int]):
         self.sub_title = f"{self._host}:{self._port}"
         
         if args.csv:
-            self._csv_sink = CsvSink(args.csv,ac_filter=args.ac_filter)  
+            filters: list[str | None] = args.ac_filter or [None]
+            if len(filters) == 1:
+                self._csv_sink = CsvSink(args.csv, ac_filter=filters[0])
+            else:
+                self._csv_sink = MultiSink([CsvSink(args.csv, ac_filter=f) for f in filters])
         else:
             self._csv_sink = None
             
@@ -439,40 +445,42 @@ class ModesLiveApp(App[int]):
 
     def _worker_loop(self) -> None:
         try:
-            with open("debug.log", "w", buffering=1) as fh:
-                for hex_msg, ts in self._source:
-                    if self._stop_flag:
-                        break
-                    try:
-                        decoded = self._pipe.decode(hex_msg, timestamp=ts)
-                    except Exception:
-                        self._msg_count += 1
-                        continue
+            for hex_msg, ts in self._source:
+                if self._stop_flag:
+                    break
+                try:
+                    decoded = self._pipe.decode(hex_msg, timestamp=ts)
+                except Exception:
                     self._msg_count += 1
-                    
-                    decoded_csv = decoded.copy()
-                    decoded_csv["timestamp"] = ts  
-                    decoded_csv["raw_msg"] = hex_msg  
-                    
-                    # CSV sink (stateless)
-                    if self._csv_sink is not None:
-                        try:
-                            self._csv_sink.write(decoded_csv)
-                        except Exception:
-                            pass
-                        
-                    icao = decoded.get("icao")
-                    if not icao:
-                        continue
-                    state = self._state.get(icao)
-                    if state is None:
-                        state = {"_first_seen": ts, "_last_seen": ts}
-                        self._state[icao] = state
-                    for key in _TRACKED_FIELDS:
-                        val = decoded.get(key)
-                        if val is not None:
-                            state[key] = val
-                    state["_last_seen"] = ts
+                    continue
+                self._msg_count += 1
+
+                decoded_csv = decoded.copy()
+                decoded_csv["timestamp"] = ts
+                decoded_csv["raw_msg"] = hex_msg
+
+                if self._csv_sink is not None:
+                    try:
+                        self._csv_sink.write(decoded_csv)
+                    except Exception:
+                        pass
+
+                icao = decoded.get("icao")
+                if not icao:
+                    continue
+                state = self._state.get(icao)
+                if state is None:
+                    state = {"_first_seen": ts, "_last_seen": ts}
+                    self._state[icao] = state
+                for key in _TRACKED_FIELDS:
+                    val = decoded.get(key)
+                    if val is not None:
+                        state[key] = val
+                # Mark when CPR frames arrive so the UI can show "..."
+                # instead of blank while bootstrap is still collecting.
+                if decoded.get("cpr_format") is not None:
+                    state["_cpr_seen"] = True
+                state["_last_seen"] = ts
         except UnsupportedStreamError as e:
             self._worker_error = e
             with contextlib.suppress(Exception):

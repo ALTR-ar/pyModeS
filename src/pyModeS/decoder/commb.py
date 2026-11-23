@@ -54,6 +54,17 @@ _COMMB_DISPATCH: dict[str, Callable[[int], dict[str, Any]]] = {
     "6,0": bds60.decode_bds60,
 }
 
+_FLIGHT_STATUS_TEXT = {
+    0: "No alert, no SPI, airborne",
+    1: "No alert, no SPI, on ground",
+    2: "Alert, no SPI, airborne",
+    3: "Alert, no SPI, on ground",
+    4: "Alert, SPI, airborne or on ground",
+    5: "No alert, SPI, airborne or on ground",
+    6: "Reserved",
+    7: "Reserved",
+}
+
 
 @register(20, 21)
 class CommB(DecoderBase):
@@ -66,11 +77,16 @@ class CommB(DecoderBase):
         # Both live at bits 19-31 of the full 112-bit message
         # (same slot as DF4/DF5 AC/ID).
         ac_or_id = self._extract(19, 13)
+
         if self._df == 20:
             result["altitude"] = altcode_to_altitude(ac_or_id)
         else:  # DF21
             result["squawk"] = idcode_to_squawk(ac_or_id)
-
+            
+        fs = self._extract(5, 3)
+        result["flight_status"] = fs
+        result["flight_status_text"] = _FLIGHT_STATUS_TEXT.get(fs, "Unknown")
+        
         # BDS inference. `known` is threaded through for Phase 3
         # disambiguation of BDS 5,0 / 6,0 when the caller supplies
         # aircraft state.

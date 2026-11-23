@@ -997,11 +997,9 @@ class PipeDecoder:
                 0, self._stats["pending_pairs"] - len(fresh)
             )
 
-            # Position-filter dispatch: bootstrapping ICAOs hold every
-            # paired dict (primary + orphans) as a single candidate so
-            # that nothing unverified reaches the caller; locked ICAOs
-            # run the motion check against the primary resolution and
-            # share the verdict with the orphans.
+            # Position-filter dispatch: first resolved pair for an ICAO
+            # seeds the history immediately (no bootstrap hold); subsequent
+            # pairs run the motion-consistency check against that history.
             if lat is not None and lon is not None:
                 if icao in self._position_history:
                     if not self._motion_consistent(icao, lat, lon, timestamp):
@@ -1009,9 +1007,7 @@ class PipeDecoder:
                             d["latitude"] = None
                             d["longitude"] = None
                         self._stats["position_rejected"] += 1
-                    self._update_position_history(icao, lat, lon, timestamp)
-                else:
-                    self._bootstrap_accumulate(paired_dicts, icao, lat, lon, timestamp)
+                self._update_position_history(icao, lat, lon, timestamp)
             return
 
         # No fresh opposite — append this frame to its own parity deque,
@@ -1019,6 +1015,34 @@ class PipeDecoder:
         deque = this_pending.setdefault(icao, [])
         deque.append((timestamp, cpr_lat, cpr_lon, result))
         self._stats["pending_pairs"] += 1
+
+        # Post-bootstrap: decode directly against the last known position
+        # so every CPR frame emits lat/lon instead of waiting for a pair.
+        # cpr_lat/cpr_lon (raw 17-bit values) are preserved on the result.
+        if icao in self._position_history:
+            from pyModeS.position import (
+                airborne_position_with_ref,
+                resolve_surface_ref,
+                surface_position_with_ref,
+            )
+            ref_lat, ref_lon, _ref_t = self._position_history[icao][-1]
+            if bds == "0,5":
+                lat, lon = airborne_position_with_ref(
+                    cpr_format, cpr_lat, cpr_lon, ref_lat, ref_lon
+                )
+            else:  # "0,6" surface
+                if self._surface_ref is None:
+                    return
+                sr_lat, sr_lon = resolve_surface_ref(self._surface_ref)
+                lat, lon = surface_position_with_ref(
+                    cpr_format, cpr_lat, cpr_lon, sr_lat, sr_lon
+                )
+            if self._motion_consistent(icao, lat, lon, timestamp):
+                result["latitude"] = lat
+                result["longitude"] = lon
+            else:
+                self._stats["position_rejected"] += 1
+            self._update_position_history(icao, lat, lon, timestamp)
 
     def _resolve_pair(
         self,
@@ -1107,6 +1131,7 @@ class PipeDecoder:
     def stats(self) -> dict[str, int]:
         """Return a snapshot of internal counters."""
         return dict(self._stats)
+
 
     def reset(self) -> None:
         """Clear all per-ICAO state and counters."""

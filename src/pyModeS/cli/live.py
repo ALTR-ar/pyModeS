@@ -32,7 +32,7 @@ from types import FrameType
 from typing import Any
 
 from pyModeS import PipeDecoder
-from pyModeS.cli._sink import JsonLinesSink, NullSink, TeeSink, CsvSink
+from pyModeS.cli._sink import JsonLinesSink, NullSink, TeeSink, CsvSink, MultiSink
 from pyModeS.cli._source import NetworkSource, UnsupportedStreamError
 
 
@@ -189,19 +189,26 @@ def _parse_surface_ref(value: str | None) -> Any:
 
 def _build_sink(
     args: argparse.Namespace,
-) -> JsonLinesSink | NullSink | TeeSink | CsvSink:
+) -> JsonLinesSink | NullSink | TeeSink | CsvSink | MultiSink:
     stdout_sink: JsonLinesSink | NullSink = (
         NullSink() if args.quiet else JsonLinesSink(sys.stdout)
     )
-    if args.dump_to is not None and args.csv is not None:
+
+    csv_sink: CsvSink | MultiSink | None = None
+    if args.csv is not None:
+        filters: list[str | None] = args.ac_filter or [None]
+        if len(filters) == 1:
+            csv_sink = CsvSink(args.csv, ac_filter=filters[0])
+        else:
+            csv_sink = MultiSink([CsvSink(args.csv, ac_filter=f) for f in filters])
+
+    if args.dump_to is not None and csv_sink is not None:
         file_sink = JsonLinesSink.to_file(args.dump_to)
-        csv_sink = CsvSink(args.csv, ac_filter=args.ac_filter)
         return TeeSink(stdout_sink, TeeSink(file_sink, csv_sink))
     if args.dump_to is not None:
         file_sink = JsonLinesSink.to_file(args.dump_to)
         return TeeSink(stdout_sink, file_sink)
-    if args.csv is not None:
-        csv_sink = CsvSink(args.csv, ac_filter=args.ac_filter)
+    if csv_sink is not None:
         return TeeSink(stdout_sink, csv_sink)
     return stdout_sink
 
