@@ -22,9 +22,10 @@ pip install "pyModeS>=3"
 pip install "pyModeS<3"
 ```
 
-Both can coexist on PyPI because v3 uses the lowercase `pyModeS` name
-and v2 uses the camelCase `pyModeS` name — they're distinct
-distributions that never collide during import.
+Versions 2 and 3 occupy the same PyPI distribution and import name.
+Python package names are normalized case-insensitively, so installing
+one version replaces the other in a given environment. Use separate
+virtual environments when running or comparing both versions.
 
 ## Import change
 
@@ -84,7 +85,7 @@ result.callsign  # same as result["callsign"]
 | `pms.adsb.position(m0, m1, t0, t1)` | `pyModeS.decode([m0, m1], timestamps=[t0, t1])` |
 | `pms.adsb.position_with_ref(msg, lat, lon)` | `pyModeS.decode(msg, reference=(lat, lon))` |
 | `pms.adsb.surface_position_with_ref(msg, lat, lon)` | `pyModeS.decode(msg, surface_ref=(lat, lon))` |
-| `pms.bds.infer(msg, mrar=True)` | `pyModeS.decode(msg)["bds"]` (for DF20/21) |
+| `pms.bds.infer(msg, mrar=True)` | `pyModeS.decode(msg, include_meteo=True)["bds"]` (for DF20/21) |
 | `pms.commb.cs20(msg)` | `pyModeS.decode(msg)["callsign"]` (for BDS 2,0) |
 | `pms.commb.selalt40mcp(msg)` | `pyModeS.decode(msg)["selected_altitude_mcp"]` |
 | `pms.commb.selalt40fms(msg)` | `pyModeS.decode(msg)["selected_altitude_fms"]` |
@@ -102,12 +103,65 @@ result.callsign  # same as result["callsign"]
 
 See the [API reference](api.md) for the full list of decoded fields.
 
-## Renamed keys
+## Returned fields
 
-No pyModeS 2.21.1 field names were renamed in v3. The field-name
-surface is identical across the two versions; only the invocation
-shape changed (function-per-field → single `decode()`). See the
-equivalence table above.
+### Mode-S uplink interrogations
+
+Use `pyModeS.decode(msg, uplink=True)` for ground-to-air interrogations.
+The direction must be explicit because UF and DF numbers overlap.
+Lists of uplink messages are supported and decoded independently.
+`Message(msg, uplink=True).decode()` provides the same fields.
+
+```python
+result = pyModeS.decode("2097AB60000000", uplink=True)
+result["uf"]                # 4
+result["bds"]               # "2,B"
+result["interrogator_code"] # "II10"
+result["lockout"]           # True
+```
+
+| v2 `pyModeS.decoder.uplink` helper | v3 result field |
+|---|---|
+| `uf(msg)` | `uf` (values 24–31 normalize to 24) |
+| `uplink_icao(msg)` | `icao` |
+| `bds(msg)` | `bds`, using comma notation (`"20"` becomes `"2,0"`) |
+| `pr(msg)` | `probability_of_reply` (raw PR code, 0–15) |
+| `ic(msg)` | `interrogator_code` (`"II…"` or `"SI…"`) |
+| `lockout(msg)` | `lockout` |
+| `uplink_fields(msg)["DI"]` | `designator_identification` |
+| `uplink_fields(msg)["RR"]` | `reply_request` |
+| `uplink_fields(msg)["RRS"]` | `reply_request_subfield` |
+
+UF11 provides PR and interrogator code fields. UF4/5/20/21 provide
+selective interrogation fields. Other UFs return header fields only.
+Inapplicable fields are omitted; `full_dict=True` fills them with `None`.
+Reserved UF11 code labels produce `interrogator_code=None`.
+The PR code retains the v2 encoding: codes 0–4 mean reply probabilities
+1, 1/2, 1/4, 1/8, and 1/16; codes 8–12 use those probabilities and disregard
+lockout. Codes 5–7 and 13–15 are unassigned.
+
+Uplink address recovery follows the v2 algorithm. For UF11, `crc_valid` checks
+the recovered address against the fixed all-call address `FFFFFF`; ICAO hints
+are ignored. For other UFs, `crc_valid` is `None` without an independent address.
+Pass `icao="ABCDEF"` to check address/parity against a known address.
+Payload-only construction and `PipeDecoder` handle
+downlink messages. Use `decode(list_of_messages, uplink=True)` for uplink batches.
+
+The CLI accepts the same direction flag for a single message, inline batch,
+or file:
+
+```sh
+modes decode 2097AB60000000 --uplink
+modes decode --file interrogations.csv --uplink --compact
+```
+
+### Downlink fields
+
+pyModeS 2 did not expose one unified record with a field-name surface:
+individual helpers returned scalars or function-specific tuples. pyModeS 3
+collects those values into explicitly named dictionary fields. The equivalence
+table above is the mapping to use when replacing each v2 helper or unpacked
+tuple element.
 
 ## Live streams
 
@@ -143,8 +197,8 @@ from pyModeS import PipeDecoder
 pipe = PipeDecoder(surface_ref="EHAM")
 for msg, t in stream:
     result = pipe.decode(msg, timestamp=t)
-    # lat/lon is populated when the CPR pair resolves
-    if "latitude" in result:
+    # A global pair seeds the track; later frames also use local CPR.
+    if result.get("latitude") is not None:
         print(result["icao"], result["latitude"], result["longitude"])
 ```
 
@@ -152,7 +206,7 @@ for msg, t in stream:
 
 - Per-ICAO state for Comm-B BDS 5,0/6,0 disambiguation (Phase 3 scoring)
 - TTL eviction of stale aircraft after 5 minutes of silence
-- DF20/21 `icao_verified=True` promotion via a trusted-ICAO set
+- DF20/21 `icao_verified=True` promotion via a trusted-ICAO cache
   populated from clean DF17/18 plain-text addresses
 
 See the [PipeDecoder deep-dive](pipe.md) for the full state model
@@ -165,10 +219,10 @@ pyModeS 3 replaces it with a new `modes` command that has subcommands:
 
 ```sh
 # v2
-modeslive --source net --connect host 30005 beast
+modeslive --source net --connect host 10006 beast
 
 # v3
-modes live --network host:30005
+modes live --network host:10006
 ```
 
 Notable differences:
@@ -177,8 +231,8 @@ Notable differences:
   of `modes live`.
 - **Simplified network flag.** `--network HOST:PORT` replaces
   `--source net --connect HOST PORT DATATYPE`. Only the Mode-S
-  Beast binary format is supported; point at dump1090's port
-  30005 (or the equivalent beast port on your feed).
+  Beast binary format is supported; use the configured Beast
+  port on your feed.
 - **Firehose default.** `modes live` writes JSON lines to stdout
   by default — pipe to `jq`, redirect to a file, or stream into
   a parquet writer.
@@ -187,14 +241,17 @@ Notable differences:
   (`pip install "pyModeS[tui]"`). Powered by `rich` instead of
   `curses`.
 - **RTL-SDR.** Deferred to a follow-up release. For now, pipe
-  through `dump1090 --net` and connect via `--network
-  localhost:30005`.
+  through `dump1090 --net` with Beast output configured on port
+  10006 and connect via `--network localhost:10006`.
 
 ## Removed features
 
-- **Cython extension (`c_common`)** — v3 is pure Python and is
-  measurably faster than v2's compiled C path. No reintroduction
-  planned.
+- **Cython extension (`c_common`)** — v3 is pure Python. Performance depends
+  on the workload: the unified decoder does more work per offered message than
+  a selective sequence of v2 helpers, while its stateful streaming path avoids
+  repeated parsing and scales independently of the active-aircraft count.
+  Applications that consume only selected DF/typecode combinations should
+  prefilter them as described in the [PipeDecoder guide](pipe.md#high-volume-pre-filtering).
 - **Python 3.9 / 3.10 support** — v3 requires Python 3.11+.
 - **`pyModeS.streamer` subpackage** — the legacy streamer is not
   ported. The `modeslive` entry point is replaced by `modes live`
@@ -208,6 +265,6 @@ If any of your code still depends on v2 behavior, pin to v2 explicitly:
 pyModeS<3
 ```
 
-and migrate incrementally. v3 and v2 install under different import
-names (`pyModeS` vs `pyModeS`), so they can coexist in the same
-virtualenv during migration — import whichever you need per module.
+and migrate incrementally. Because v2 and v3 share the `pyModeS`
+distribution and import name, they cannot coexist in one virtual environment.
+Use a separate environment or process for each version while comparing them.

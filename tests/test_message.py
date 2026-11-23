@@ -117,6 +117,15 @@ class TestMessageConstruction:
         m = Message(0x8D406B902015A678D4D220AA4BDA)
         assert m._length == 112
 
+    @pytest.mark.parametrize("value", [-1, 1 << 112])
+    def test_integer_must_fit_declared_unsigned_width(self, value):
+        with pytest.raises(ValueError, match="fit in 112 unsigned bits"):
+            Message(value, length=112)
+
+    def test_short_integer_must_fit_56_bits(self):
+        with pytest.raises(ValueError, match="fit in 56 unsigned bits"):
+            Message(1 << 56, length=56)
+
     def test_invalid_hex_raises(self):
         with pytest.raises(InvalidHexError):
             Message("XYZ")
@@ -163,6 +172,15 @@ class TestMessageDfIcaoCrc:
         m = Message(f"{n_full:014X}")
         assert m.df == 4
         assert m.icao == "400940"
+        assert m.crc_valid is None
+
+    def test_address_parity_validates_with_independent_icao_hint(self):
+        frame = "A000083E202CC371C31DE0AA1CCF"
+        derived = Message(frame).icao
+
+        assert Message(frame).crc_valid is None
+        assert Message(frame, icao_hint=derived).crc_valid is True
+        assert Message(frame, icao_hint="000000").crc_valid is False
 
     def test_df17_crc_valid(self):
         # Known-valid DF17 message — CRC remainder should be 0
@@ -206,6 +224,11 @@ class TestMessageFromPayload:
         assert m.df == 17
         assert m.icao == "406B90"
         assert m.typecode == 4  # payload[0:5] = 00100 = 4
+        assert m.crc_valid is False
+
+    def test_commb_payload_never_claims_crc_validation(self):
+        m = Message.from_payload("202CC371C31DE0", df=20, icao="00083E")
+        assert m.crc_valid is False
 
     def test_from_payload_wrong_length_raises(self):
         with pytest.raises(InvalidLengthError):

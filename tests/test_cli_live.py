@@ -15,9 +15,13 @@ class FakeSource:
 
     def __init__(self, frames: list[tuple[str, float]]) -> None:
         self._frames = frames
+        self.closed = False
 
     def __iter__(self):
         yield from self._frames
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class TestLiveMainLoop:
@@ -41,7 +45,7 @@ class TestLiveMainLoop:
         )
         from pyModeS.cli import main
 
-        code = main(["live", "--network", "host.example:30005"])
+        code = main(["live", "--network", "host.example:10006"])
         assert code == 0
         captured = capsys.readouterr()
         lines = [line for line in captured.out.splitlines() if line.strip()]
@@ -112,6 +116,17 @@ class TestLiveMainLoop:
         for key in _FULL_SCHEMA:
             assert key in data
 
+    def test_include_meteo(self, capsys):
+        self._fake_source = FakeSource([("A0001692185BD5CF400000DFC696", 1000.0)])
+        from pyModeS.cli import main
+
+        code = main(["live", "--network", "h:1", "--include-meteo"])
+        assert code == 0
+        captured = capsys.readouterr()
+        data = json.loads(captured.out.strip().splitlines()[-1])
+        assert data["bds"] == "4,4"
+        assert data["wind_speed"] == 22
+
     def test_tui_without_textual_exits_three(self, capsys, monkeypatch):
         """--tui without the textual optional extra exits 3 with install hint."""
         self._fake_source = FakeSource([])
@@ -153,6 +168,9 @@ class TestLiveGracefulShutdown:
         stop_holder: dict[str, Any] = {}
 
         class SlowSource:
+            def __init__(self):
+                self.closed = False
+
             def __iter__(self):
                 yield ("8D406B902015A678D4D220AA4BDA", 1000.0)
                 # Wait for the test to flip the stop flag
@@ -162,14 +180,17 @@ class TestLiveGracefulShutdown:
                         break
                     time.sleep(0.01)
 
+            def close(self):
+                self.closed = True
+
         def _fake_network_source(host, port, **kwargs):
             return SlowSource()
 
         original_install = live_mod._install_signal_handlers
 
-        def capturing_install(stop):
+        def capturing_install(stop, source):
             stop_holder["flag"] = stop
-            original_install(stop)
+            original_install(stop, source)
 
         monkeypatch.setattr(live_mod, "NetworkSource", _fake_network_source)
         monkeypatch.setattr(live_mod, "_install_signal_handlers", capturing_install)

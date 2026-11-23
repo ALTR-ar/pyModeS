@@ -6,12 +6,16 @@ message at a time and maintains per-ICAO state across calls, so:
 - **CPR pair resolution** — an even/odd pair of airborne-position
   frames produced ≤ `pair_window` seconds apart is resolved to absolute
   lat/lon without needing an external reference.
+- **Local airborne CPR** — after global pairs establish a validated track,
+  each subsequent airborne-position frame can be resolved immediately from
+  the last accepted position, provided it is no older than
+  `local_ref_window`.
 - **BDS 5,0 / 6,0 disambiguation** — when a Comm-B message plausibly
   matches both registers, prior observations of groundspeed, track,
   and heading score the candidates and pick the better fit.
-- **DF20/21 ICAO verification** — CRC-valid DF17/18 frames populate a
-  trusted-ICAO set; a later DF20/21 whose CRC-derived ICAO matches one
-  in the set is flagged with `icao_verified=True`.
+- **DF20/21 ICAO verification** — timestamped CRC-valid DF17/18 frames
+  populate a trusted-ICAO cache; a later DF20/21 whose CRC-derived ICAO
+  matches a non-expired entry is flagged with `icao_verified=True`.
 - **Phantom rejection** — CRC alone doesn't catch every FRUIT frame
   that happens to land with a plausible ICAO. Several cross-checks
   layered on top of CRC use per-ICAO anchors to drop phantoms before
@@ -22,7 +26,13 @@ message at a time and maintains per-ICAO state across calls, so:
 ```python
 from pyModeS import PipeDecoder
 
-pipe = PipeDecoder(surface_ref="EHAM", pair_window=10.0, eviction_ttl=300.0)
+pipe = PipeDecoder(
+    surface_ref="EHAM",
+    pair_window=10.0,
+    local_ref_window=30.0,
+    eviction_ttl=300.0,
+    eviction_interval=1.0,
+)
 
 for raw_msg, timestamp in stream:
     result = pipe.decode(raw_msg, timestamp=timestamp)
@@ -35,16 +45,29 @@ pipe.reset()       # clear all state
 
 ## Constructor options
 
-- `surface_ref` — airport code or `(lat, lon)` for surface CPR
-  resolution (single-message path). Required for surface positions to
-  return lat/lon. Not needed for airborne.
+- `surface_ref` — optional airport code or `(lat, lon)` for surface CPR
+  resolution. It is used only for BDS 0,6 surface messages and can never seed
+  airborne decoding.
+- `include_meteo` — include heuristic BDS 4,4 routine meteorological reports
+  and BDS 4,5 meteorological hazard reports in Comm-B inference. Default
+  `False`; enable only when the input is expected to contain these registers,
+  because their payload patterns can overlap other Comm-B formats.
 - `full_dict` — if `True`, every decoded result is populated with every
   key from the canonical schema (missing fields = `None`).
 - `pair_window` — maximum age gap (seconds) between an even and odd
   CPR frame for them to count as a pair. Default `10.0`.
+- `local_ref_window` — maximum age of the last validated airborne position
+  used for locally-unambiguous CPR. Default `30.0` seconds; set to `0` to
+  disable local airborne decoding.
 - `eviction_ttl` — per-ICAO state and pending CPR frames older than
-  this are dropped lazily at the start of the next `decode()` call
-  with a timestamp. Default `300.0` (5 minutes).
+  this are ignored immediately when that ICAO is decoded again. A periodic
+  global sweep removes inactive aircraft from memory. Default `300.0`
+  (5 minutes).
+- `eviction_interval` — minimum timestamp gap between full cache sweeps.
+  Default `1.0` second, capped at `eviction_ttl`. This affects only when
+  inactive entries are reclaimed from memory; it does not extend the state
+  lifetime used for decoding. Set to `0` to sweep on every timestamped
+  message.
 - `max_speed_kt` — ceiling for the per-ICAO motion check (see
   [Validation](#validation)). Default `1500` — ~2× typical airliner
   cruise; loose enough to accept fast business jets and wind-boosted
@@ -69,12 +92,65 @@ and `altitude` are known but `ias`, `mach`, or `tas` aren't yet
 observed, they're derived via the ISA atmosphere model so BDS 6,0
 scoring still has a reference field.
 
-State entries carry a `_last_seen` timestamp. On each `decode()` call
-with a timestamp, entries older than `eviction_ttl` are dropped.
+State entries carry a `_last_seen` timestamp. Messages with no tracked
+fields do not create otherwise-empty state entries, but they do refresh
+an existing entry for that ICAO. Before cached state is consumed, the
+current ICAO is checked against `eviction_ttl` in constant time. Full cache
+eviction runs no more than once per `eviction_interval` to reclaim inactive
+aircraft. This keeps streaming decode cost independent of the total active-
+aircraft count without allowing stale state to affect inference.
+
+### Timestamp semantics
+
+Pass the message's source or capture timestamp—not the wall-clock time at which
+replay happens. `PipeDecoder` uses it for CPR pairing, anchor age, local CPR,
+plausibility envelopes, and TTL expiry.
+
+Reordered input is supported. An older message can pair with a newer opposite
+CPR parity, but source timestamps determine which parity is newer. Older state,
+altitude, velocity, and local-position observations cannot replace a newer
+anchor. Eviction follows the stream's timestamp high-water mark, so a late
+older message cannot revive state that a newer observation already expired.
+
+If `timestamp` is omitted, stateless payload decoding and basic Comm-B state
+updates still work, but time-dependent features—CPR pair matching, local
+airborne CPR, ICAO trust promotion, plausibility anchors, and TTL expiry—cannot
+operate reliably and are skipped where required.
+
+### High-volume pre-filtering
+
+`PipeDecoder` returns a complete decode for every message offered to it.
+If an application only consumes selected downlink formats or ADS-B type
+codes, inspect those header bits first with the lightweight public helpers:
+
+```python
+from pyModeS import PipeDecoder
+from pyModeS.util import df, typecode
+
+pipe = PipeDecoder()
+
+for raw_msg, timestamp in stream:
+    downlink_format = df(raw_msg)
+    if downlink_format not in (17, 20, 21):
+        continue
+    if downlink_format == 17 and typecode(raw_msg) in (28, 29, 31):
+        continue
+
+    result = pipe.decode(raw_msg, timestamp=timestamp)
+    ...
+```
+
+`df()` and `typecode()` only inspect the required header nibbles; they do
+not compute CRC or decode payload fields. Filtering before `decode()` also
+keeps messages irrelevant to the application out of the state caches.
+
+A configurable Beast-network example is in the repository at
+`scripts/stream_filtered.py`. It defaults to the DF17/20/21 filter above and
+can connect to a live feed or replay the committed mixed-traffic capture.
 
 ## Validation
 
-On top of CRC, `PipeDecoder` runs four plausibility cross-checks
+On top of CRC, `PipeDecoder` runs five plausibility cross-checks
 against per-ICAO anchors updated only from CRC-valid frames that
 passed their own check. A frame that fails is kept (header fields
 intact) so the caller can see it, but its position / velocity fields
@@ -92,25 +168,40 @@ are scrubbed, the anchor is not updated, and state is not mutated.
 
 The first few resolved positions for a new ICAO don't yet have an
 anchor to cross-check against — so they're held back. The decoder
-collects up to 5 candidate positions into `_bootstrap`, runs a cluster
-analysis to pick a consistent seed, and only then promotes them into
+collects up to 5 candidate positions into `_bootstrap` and locks as soon as
+three positions are pairwise motion-consistent. If no such subset exists when
+the buffer reaches 5 candidates, the buffer resets. The accepted cluster seeds
 the rolling position history used for the motion check. While held,
 `latitude` / `longitude` are suppressed in the returned result; once
 the cluster locks, **both halves** of each resolved CPR pair are
 retro-filled, so batch callers who keep their result list around see
 the positions on their early samples.
 
+After bootstrap locks, its most recent accepted airborne position becomes the
+local CPR reference. A position frame without a fresh opposite parity can then
+return lat/lon in the current `decode()` result. Local candidates pass the same
+motion envelope before they update either the output or the reference. The
+optional `surface_ref` is kept separate and is never used by this path.
+
+`flush()` uses the same promotion path with a lower corroboration threshold for
+finite batches. If decoding continues afterward, the promoted airborne
+position remains available as the local CPR reference.
+
 If no consistent cluster forms, the bootstrap buffer resets and
 candidates start over — counted as `bootstrap_reset`.
 
 ### Motion check
 
-Post-bootstrap, each candidate position is compared against the most
-recent accepted anchor. The allowed distance is
-`max_speed_kt * dt + motion_margin_km`. Positions that exceed it are
-rejected (`position_rejected`) — the anchor still rotates through the
-history regardless of accept/reject, so real tracks eventually
-out-vote lingering phantoms.
+Post-bootstrap, each candidate position is compared against the rolling
+five-position history. It is accepted when at least one history entry is within
+`max_speed_kt * dt + motion_margin_km`. A rejected global candidate is still
+added to this motion history so a sustained real track can eventually rotate
+past a bad initial cluster; it increments `position_rejected` and is not
+emitted.
+
+The local airborne CPR reference is deliberately separate. Only accepted
+airborne positions can update it, so neither a rejected global candidate nor a
+position derived from `surface_ref` can seed later local airborne decoding.
 
 ### BDS coverage
 
@@ -123,7 +214,7 @@ What happens per register when it's offered to `PipeDecoder`:
 | 1,0, 1,7 data-link capability | — | — | yes (`supported_bds`) |
 | 2,0 aircraft identification | — | — | yes (`callsign`) |
 | 4,0 selected vertical intention | — | — | yes (MCP/FMS alt, VNAV, etc.) |
-| 4,4, 4,5 meteorological | — | — | yes (wind, temperature, turbulence, …) |
+| 4,4, 4,5 meteorological (opt-in) | — | — | yes (wind, temperature, turbulence, …) |
 | 5,0 track & turn | gs / true_track | yes | yes |
 | 6,0 heading & speed | magnetic_heading | yes | yes |
 
@@ -174,10 +265,12 @@ locking is needed — just don't share the decoder across threads.
 - `velocity_mismatch` — frames rejected by a velocity / heading check
 - `position_rejected` — post-bootstrap positions rejected by the
   motion check
+- `local_positions` — airborne positions resolved immediately from the last
+  validated airborne reference
 - `bootstrap_held` — candidate positions added to the bootstrap buffer
   (some may end up promoted, others discarded on reset)
 - `bootstrap_reset` — bootstrap buffers that failed to cluster and
   restarted
 
-The trusted ICAO set, per-ICAO state, pending CPR frames, anchors,
+The trusted ICAO cache, per-ICAO state, pending CPR frames, anchors,
 bootstrap buffers, and position history are all cleared by `reset()`.

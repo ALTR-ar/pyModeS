@@ -29,7 +29,6 @@ import signal
 import sys
 import time
 from types import FrameType
-from typing import Any
 
 from pyModeS import PipeDecoder
 from pyModeS.cli._sink import JsonLinesSink, NullSink, TeeSink, CsvSink, MultiSink
@@ -45,18 +44,21 @@ class _StopFlag:
 
 def run(args: argparse.Namespace) -> int:
     """Entry point for ``modes live``. Returns exit code."""
-    host, port = _parse_network(args.network)
-    if host is None:
+    try:
+        host, port = parse_network(args.network)
+        surface_ref = parse_surface_ref(args.surface_ref)
+    except ValueError as error:
         print(
-            "modes live: error: --network must be in HOST:PORT form "
-            f"(got {args.network!r})",
+            f"modes live: error: {error}",
             file=sys.stderr,
         )
         return 2
 
-    surface_ref = _parse_surface_ref(args.surface_ref)
-
-    pipe = PipeDecoder(surface_ref=surface_ref, full_dict=args.full_dict)
+    pipe = PipeDecoder(
+        surface_ref=surface_ref,
+        include_meteo=args.include_meteo,
+        full_dict=args.full_dict,
+    )
 
     # TUI path takes its own branch — textual owns the event loop
     # and drives the source + pipe itself, so the sink pipeline
@@ -101,10 +103,6 @@ def run(args: argparse.Namespace) -> int:
     # Non-TUI sink pipeline
     sink = _build_sink(args)
 
-    # Signal handling
-    stop = _StopFlag()
-    _install_signal_handlers(stop)
-
     silence_stderr = args.quiet
     source = NetworkSource(
         host,
@@ -120,6 +118,11 @@ def run(args: argparse.Namespace) -> int:
         silent=silence_stderr,
     )
 
+    # Signal handling: closing the source unblocks an idle socket immediately,
+    # so shutdown does not wait for the read timeout.
+    stop = _StopFlag()
+    _install_signal_handlers(stop, source)
+
     last_stats_ts = time.monotonic()
 
     def _loop() -> int:
@@ -134,11 +137,10 @@ def run(args: argparse.Namespace) -> int:
                 # captures are self-contained for offline analysis.
                 # PipeDecoder already sets raw_msg on error results;
                 # we set it unconditionally here to cover the success
-                # path. `ts` comes from NetworkSource._mlat_to_wall,
-                # so it is anchored to the first frame's wall-clock
-                # and then interpolated from the beast 12 MHz MLAT
-                # counter — more accurate than time.time() on every
-                # recv() because TCP batching doesn't perturb it.
+                # path. NetworkSource anchors the last frame in each TCP burst
+                # to receive time and back-projects earlier frames from the
+                # Beast counter. This preserves within-burst timing without
+                # assigning already-received frames a future timestamp.
                 result["raw_msg"] = hex_msg
                 result["timestamp"] = ts
                 sink.write(result)
@@ -159,32 +161,11 @@ def run(args: argparse.Namespace) -> int:
     try:
         code = _loop()
     finally:
+        source.close()
         sink.close()
 
     _emit_stats_line(pipe, args.quiet, prefix="final")
     return code
-
-
-def _parse_network(value: str) -> tuple[str | None, int]:
-    """Split a HOST:PORT string. Returns (None, 0) on parse failure."""
-    if ":" not in value:
-        return None, 0
-    host, _, port_str = value.rpartition(":")
-    try:
-        port = int(port_str)
-    except ValueError:
-        return None, 0
-    return host, port
-
-
-def _parse_surface_ref(value: str | None) -> Any:
-    """Accept either an ICAO airport code or a 'lat,lon' string."""
-    if value is None:
-        return None
-    if "," in value:
-        lat_str, lon_str = value.split(",", 1)
-        return (float(lat_str.strip()), float(lon_str.strip()))
-    return value
 
 
 def _build_sink(
@@ -215,6 +196,7 @@ def _build_sink(
 def _install_signal_handlers(stop: _StopFlag) -> None:
     def _handler(signum: int, frame: FrameType | None) -> None:
         stop.stopped = True
+        source.close()
 
     # Only install in the main thread; tests that run main() in a
     # helper thread get a ValueError when calling signal.signal from

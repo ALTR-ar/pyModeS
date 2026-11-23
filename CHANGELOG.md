@@ -5,6 +5,133 @@ All notable changes to pyModeS are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [3.7.0] - 2026-11-11
+
+### Added
+
+- `decode(msg, uplink=True)` and `Message(msg, uplink=True)` decode Mode-S
+  ground-to-air interrogations. Results use `uf` instead of `df` and include
+  UF11 all-call fields and UF4/5/20/21 selective interrogation fields.
+- Uplink decoding supports message lists and `full_dict=True`. The
+  `modes decode --uplink` option supports single messages, inline batches,
+  and files.
+- UF11 parity validation checks the fixed all-call address `FFFFFF`. Other
+  uplink formats can validate parity against an independently known ICAO
+  address supplied with `icao=` or `icao_hint=`.
+- The migration guide maps v2 uplink helpers to v3 result fields.
+
+## [3.6.1] - 2026-10-19
+
+### Fixed
+
+- Keep rejected CPR positions out of trusted position history so repeated
+  messages cannot validate a previously rejected position (#204).
+
+### Changed
+
+- Clarify that decoder timestamps use seconds from a consistent clock (#203).
+- Refresh decoder guides and network examples. The filtered streaming example
+  now defaults to `localhost:10006`.
+
+## [3.6.0] — 2026-07-16
+
+### Added
+
+- `decode()`, `Message.decode()`, and `PipeDecoder` accept
+  `include_meteo=True` to opt into heuristic Comm-B BDS 4,4 routine
+  meteorological reports and BDS 4,5 meteorological hazard reports. The
+  default remains `False` because these payload patterns can overlap other
+  Comm-B registers.
+- The `modes decode`, `modes live`, and `scripts/stream_filtered.py` interfaces
+  expose the same behavior through `--include-meteo`.
+
+## [3.5.0] — 2026-07-15
+
+### Added
+
+- `PipeDecoder` now uses the last validated airborne position as a local CPR
+  reference for subsequent BDS 0,5 frames. This makes a position available on
+  the current streaming `decode()` call when no fresh global even/odd pair is
+  available, instead of relying on retroactive mutation of an earlier result.
+- `local_ref_window` configures the maximum reference age (30 seconds by
+  default); set it to zero to disable local airborne decoding.
+  `PipeDecoder.stats["local_positions"]` reports positions produced by this
+  path.
+- Position bootstrap now locks as soon as three candidates are pairwise
+  motion-consistent instead of always waiting for all five candidate slots.
+  The five-candidate limit still allows two unrelated outliers to be ignored.
+- The mixed-traffic benchmark now reports immediate streaming position yield
+  and frame-by-frame coordinate agreement for v2.21.1, released v3.4.0, and
+  v3.5.0 in addition to throughput.
+
+### Changed
+
+- `crc_valid` is now `None` when an address-parity message cannot be checked
+  independently. It remains `True` or `False` for frames whose parity can be
+  validated without assuming the address derived from that same parity.
+- `PipeDecoder` uses each message's source timestamp for state validity while
+  retaining a monotonic high-water mark for eviction. Reordered capture data
+  therefore cannot revive expired observations or prematurely evict newer
+  state.
+- Plausibility and position validation are isolated in a dedicated internal
+  module, keeping the streaming pipeline and its decision comments easier to
+  follow without changing the public API.
+- Release publishing now runs only after the full test matrix succeeds, checks
+  that the Git tag matches the package version, and smoke-tests the exact wheel
+  artifact that will be uploaded.
+
+### Fixed
+
+- Surface references remain optional and are used only for BDS 0,6 surface
+  positions. Positions derived from `surface_ref` can never seed local
+  airborne CPR decoding.
+- Rejected global position candidates cannot become local CPR references; a
+  separate last-accepted airborne reference is maintained and TTL-evicted.
+- Bootstrap promotion, including `flush()`, initializes the latest accepted
+  airborne reference while keeping surface-derived positions separate.
+- Globally decoded surface CPR positions now select the correct longitude zone
+  across the antimeridian and other CPR zone boundaries.
+- Beast stream input resynchronizes after malformed or truncated frames instead
+  of losing subsequent valid messages.
+- Beast receiver timestamps are back-projected from the current wall clock with
+  rollover-safe receiver-tick deltas, avoiding dates near the Unix epoch and
+  preserving correct timing across the 12 MHz counter rollover.
+- BDS inference compares headings using circular angular distance, so values
+  around 0/360 degrees are scored correctly.
+- Trusted ICAO observations expire according to the configured state TTL and
+  cannot be refreshed by older, reordered messages.
+- Integer messages outside the valid 56-bit and 112-bit Mode S frame ranges are
+  rejected instead of being silently truncated or misclassified.
+- Network endpoint and surface-reference CLI arguments are validated before a
+  stream starts, and network sources are closed deterministically on normal
+  exit, errors, and interruption.
+- The live terminal UI synchronizes access to shared aircraft state, preventing
+  concurrent decoder and renderer updates from racing.
+
+## [3.4.0] — 2026-07-13
+
+### Fixed
+
+- `PipeDecoder` no longer scans every per-ICAO cache on every timestamped
+  message. Full TTL eviction is throttled to a configurable one-second
+  interval by default, capped at the TTL itself. A bounded per-ICAO check
+  still expires state exactly before it is used, so sweep throttling cannot
+  change BDS inference at the TTL boundary. Set `eviction_interval=0` for
+  the former sweep-per-message memory-reclamation behavior.
+- Timestamped messages that contain no fields used for stateful
+  disambiguation no longer create empty per-ICAO state entries. Existing
+  useful state is still refreshed when such a message arrives.
+- State updates skip field extraction for downlink formats that cannot
+  contribute to stateful inference.
+
+### Added
+
+- `scripts/stream_filtered.py`, a configurable live/replay Beast example
+  demonstrating high-volume DF/typecode prefiltering before `PipeDecoder`.
+- Reproducible version-isolated benchmarks for mixed live traffic and
+  high-cardinality streaming, including checked-in reports and the public
+  Beast capture used by the mixed-traffic benchmark.
+
 ## [3.1.0] — 2026-04-14
 
 Streaming-robustness release. Adds defences against phantom positions
@@ -14,8 +141,8 @@ Comm-B reply to the wrong aircraft.
 ### Added
 
 - `PipeDecoder` bootstrap cluster analysis for the first position per
-  ICAO: lat/lon emission is held until `_BOOTSTRAP_K` (=5) candidate
-  positions agree under a motion-consistency check. Prevents an
+  ICAO: lat/lon emission is held until five candidate positions agree
+  under a motion-consistency check. Prevents an
   initial phantom frame from anchoring the rolling position history.
   On each decode the held result dicts are retro-filled once the
   cluster locks. Scattered buffers reset and accumulate a fresh K.
@@ -98,7 +225,7 @@ the migration guide.
   `bin2hex`, `crc`, `df`, `icao`, `typecode`, `altcode`, `idcode`,
   `cprNL`. Thin wrappers over `_bits.py`, `_altcode.py`, `_idcode.py`
   and `position/_cpr.py` with no logic duplication.
-- `scripts/smoke_test.sh` installs the freshly built wheel
+- `scripts/smoke_test_wheel.sh` installs the freshly built wheel
   into a clean Python 3.12 venv and verifies the public API end to
   end (single-message decode, PipeDecoder baseline, batch CPR pair
   resolution, error-dict on malformed input).

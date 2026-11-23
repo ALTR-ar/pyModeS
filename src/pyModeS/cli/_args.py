@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 
+from pyModeS.cli._parse import parse_network, parse_surface_ref
+
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level ``modes`` argument parser with both subcommands."""
@@ -75,6 +77,16 @@ def _add_decode_parser(
         help="Populate every key in the canonical schema (missing = null).",
     )
     decode_p.add_argument(
+        "--uplink",
+        action="store_true",
+        help="Decode ground-to-air Mode-S interrogations (UF) instead of replies.",
+    )
+    decode_p.add_argument(
+        "--include-meteo",
+        action="store_true",
+        help="Include heuristic Comm-B BDS 4,4/4,5 meteorological inference.",
+    )
+    decode_p.add_argument(
         "--reference",
         nargs=2,
         type=float,
@@ -104,11 +116,10 @@ def _add_live_parser(
         ),
         epilog=(
             "Examples:\n"
-            "  modes live --network localhost:30005\n"
-            "  modes live --network airsquitter.lr.tudelft.nl:10006\n"
-            "  modes live --network host:30002 --dump-to flight.jsonl\n"
-            "  modes live --network host:30002 --tui  (requires pyModeS[tui])\n"
-            "  modes live --network host:30002 --quiet --dump-to flight.jsonl\n"
+            "  modes live --network localhost:10006\n"
+            "  modes live --network host:10006 --dump-to flight.jsonl\n"
+            "  modes live --network host:10006 --tui  (requires pyModeS[tui])\n"
+            "  modes live --network host:10006 --quiet --dump-to flight.jsonl\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -129,6 +140,11 @@ def _add_live_parser(
         "--full-dict",
         action="store_true",
         help="Emit every key in the canonical schema (missing = null).",
+    )
+    live_p.add_argument(
+        "--include-meteo",
+        action="store_true",
+        help="Include heuristic Comm-B BDS 4,4/4,5 meteorological inference.",
     )
     live_p.add_argument(
         "--dump-to",
@@ -189,6 +205,10 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     and exits 2 — on the first violation.
     """
     if args.command == "decode":
+        try:
+            parse_surface_ref(args.surface_ref)
+        except ValueError as error:
+            parser.error(str(error))
         if args.file is not None and args.reference is not None:
             parser.error(
                 "--reference is only valid with a single positional MESSAGE "
@@ -207,6 +227,11 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             )
 
     if args.command == "live":
+        try:
+            parse_network(args.network)
+            parse_surface_ref(args.surface_ref)
+        except ValueError as error:
+            parser.error(str(error))
         if args.tui and args.dump_to is not None:
             parser.error(
                 "--tui and --dump-to are mutually exclusive: the TUI takes "

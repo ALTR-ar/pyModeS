@@ -38,7 +38,7 @@ print(result)
 
 ### Batch decode (mixed message types)
 
-Pass a list of hex strings and parallel timestamps. Any mix of
+Pass a list of hex strings and parallel timestamps in seconds. Any mix of
 downlink formats, typecodes, and Comm-B registers is fine —
 the dispatcher routes each message to the right decoder and
 uses the timestamps to resolve CPR pairs and disambiguate
@@ -82,7 +82,9 @@ print(r["latitude"], r["longitude"])  # 43.6264..., 1.3747...
 `PipeDecoder` is stateful — it holds per-ICAO state across calls,
 matches CPR pairs automatically, evicts stale aircraft after a
 TTL, and flags DF20/21 messages as `icao_verified` when their
-CRC-derived ICAO was already seen in a clean DF17/18 plaintext.
+CRC-derived ICAO was seen recently in clean DF17/18 plaintext.
+
+Pass timestamps in seconds from a consistent clock.
 
 ```python
 from pyModeS import PipeDecoder
@@ -90,7 +92,7 @@ from pyModeS import PipeDecoder
 pipe = PipeDecoder(surface_ref="EHAM")
 for msg, timestamp in stream:
     decoded = pipe.decode(msg, timestamp=timestamp)
-    if "latitude" in decoded:
+    if decoded.get("latitude") is not None:
         print(decoded["icao"], decoded["latitude"], decoded["longitude"])
 ```
 
@@ -145,21 +147,17 @@ cat taxi.log | modes decode --file - --surface-ref LFBO
 
 ```sh
 # Stream decoded JSON lines from a dump1090-style beast feed
-modes live --network localhost:30005
+modes live --network localhost:10006
 
 # Tee output to a file
-modes live --network host:30005 --dump-to flight.jsonl
-
-# Stream from the TU Delft public feed (live aircraft over Europe)
-modes live --network airsquitter.lr.tudelft.nl:10006
+modes live --network host:10006 --dump-to flight.jsonl
 
 # Interactive live aircraft table (requires pyModeS[tui] extra)
 pip install "pyModeS[tui]"
-modes live --network host:30005 --tui
+modes live --network host:10006 --tui
 ```
 
-Mode-S Beast binary format is supported (dump1090 port 30005 and
-equivalents). See [`docs/quickstart.md`](./docs/quickstart.md) for
+Mode-S Beast binary format is supported (dump1090 and compatible feeds). See [`docs/quickstart.md`](./docs/quickstart.md) for
 the full command reference.
 
 ## Features
@@ -167,35 +165,15 @@ the full command reference.
 - Unified `decode()` returns every decodable field in one dict
 - Batch mode preserves list length (errors become error-dicts, not
   exceptions)
-- `PipeDecoder` for streams: per-ICAO state, CPR pair accumulation,
-  TTL eviction, DF20/21 ICAO verification via trusted-set promotion
+- `PipeDecoder` for streams: per-ICAO state, global and local CPR position
+  decoding, TTL eviction, DF20/21 ICAO verification via trusted-set promotion
 - `full_dict=True` populates every key in the canonical 123-field
   schema for pandas / parquet workflows
 - `known=` aircraft state disambiguates Comm-B BDS 5,0/6,0 ambiguity
+- `include_meteo=True` opts into heuristic Comm-B BDS 4,4/4,5 inference
 - Airport ICAO database for surface CPR resolution (`surface_ref="EHAM"`)
 - Type-checked under mypy strict across all source files
 - Golden-file oracle regression test against `pyModeS 2.21.1`
-
-## Performance
-
-Measured on jet1090's
-[`long_flight.csv`](https://github.com/xoolive/jet1090/blob/master/crates/rs1090/data/long_flight.csv)
-(172,432 Beast-format messages, 7 runs × 1 loop, mean timings,
-single-core only):
-
-| Decoder | Wall time | Throughput | vs pyModeS v3 |
-|---|---|---|---|
-| **pyModeS v3 (pure Python)** | **2.06s ± 0.01** | **83,549 msg/s** | **1.00×** |
-| pyModeS 2.21.1 (Python with compiled C) | 5.03s ± 0.01 | 34,303 msg/s | 0.41× |
-| rs1090 (Rust) | 5.60s ± 0.01 | 30,798 msg/s | 0.37× |
-| pyModeS 2.21.1 (Python) | 9.09s ± 0.02 | 18,959 msg/s | 0.23× |
-
-pyModeS v3 is **2.44× faster** than `pyModeS 2.21.1`'s compiled C
-extension, **4.41× faster** than `pyModeS 2.21.1` pure-Python, and
-**2.71× faster** than rs1090's single-core Rust — all while remaining
-pure Python with no C/Cython build.
-
-Reproduce with `scripts/benchmark_decode.py`.
 
 ## Supported messages
 
@@ -221,6 +199,10 @@ Reproduce with `scripts/benchmark_decode.py`.
   - BDS 4,5: meteorological hazard report
   - BDS 5,0: track and turn report
   - BDS 6,0: heading and speed report
+
+BDS 4,4 and 4,5 are heuristic and disabled by default. Enable them with
+`decode(..., include_meteo=True)` or `PipeDecoder(include_meteo=True)` when
+these meteorological registers are expected on the input feed.
 
 ## Migrating from pyModeS 2.x
 

@@ -17,10 +17,13 @@ This module defines two public types:
 
 import json
 from functools import cached_property
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self, cast
 
 from pyModeS._bits import crc_remainder, extract_unsigned
 from pyModeS.errors import InvalidHexError, InvalidLengthError, UnknownDFError
+
+if TYPE_CHECKING:
+    from pyModeS.decoder.commb import CommB
 
 _HEX_CHARS = frozenset("0123456789abcdefABCDEF")
 _VALID_LENGTHS = (56, 112)
@@ -64,13 +67,20 @@ class Message:
     """Canonical internal representation of a Mode-S message.
 
     Stores the message as a Python int of 56 or 112 bits. Header
-    fields (df, icao, crc, crc_valid) are computed eagerly in
+    fields (df, uf, icao, crc, crc_valid) are computed eagerly in
     __init__ as plain instance attributes.
 
     Construction:
         Message("8D406B902015A678D4D220AA4BDA")  # long from hex
         Message("20000000000000")                 # short from hex
         Message(0x8D406B9020..., length=112)      # from int with explicit length
+        Message("2097AB60000000", uplink=True)  # ground-to-air interrogation
+
+    Set ``uplink=True`` for interrogations. Read ``uf`` for their format;
+    ``df`` is only meaningful for downlink replies. Uplink decoding uses
+    separate address recovery and returns ``uf`` in place of ``df``.
+    UF11 validates parity against the fixed all-call address ``FFFFFF``
+    and ignores ``icao_hint``.
 
     Alternative construction from the payload alone:
         Message.from_payload("2015A678D4D220", df=17, icao="406B90")
@@ -88,7 +98,9 @@ class Message:
         *,
         length: int | None = None,
         icao_hint: str | None = None,
+        uplink: bool = False,
     ) -> None:
+        self._uplink = uplink
         if isinstance(msg, str):
             self._n, self._length = self._parse_hex(msg)
         elif isinstance(msg, bytes):
@@ -102,6 +114,10 @@ class Message:
             if self._length not in _VALID_LENGTHS:
                 raise InvalidLengthError(
                     actual=self._length // 4, expected=_HEX_LENGTHS
+                )
+            if msg < 0 or msg >= 1 << self._length:
+                raise ValueError(
+                    f"integer message must fit in {self._length} unsigned bits"
                 )
         else:
             raise TypeError(f"msg must be str, int, or bytes; got {type(msg).__name__}")
@@ -131,22 +147,48 @@ class Message:
         length = self._length
         self.df: int = (n >> (length - 5)) & 0x1F
         self.crc: int = crc_remainder(n, length)
+        self.uf: int | None = None
+        if self._uplink:
+            from pyModeS.decoder.uplink import uplink_icao
+
+            self.uf = min(self.df, 24)
+            recovered_icao = uplink_icao(n, length)
+            self.icao: str
+            self.crc_valid: bool | None
+            if self.uf == 11:
+                # All-call interrogations always use the fixed all-ones
+                # address. An aircraft hint must not override this check.
+                self.icao = recovered_icao
+                self.crc_valid = recovered_icao == "FFFFFF"
+            else:
+                self.icao = self._icao_hint or recovered_icao
+                self.crc_valid = (
+                    recovered_icao == self._icao_hint
+                    if self._icao_hint is not None
+                    else None
+                )
+            return
         if self.df in (11, 17, 18):
             icao_int = (n >> (length - 32)) & 0xFFFFFF
-            self.icao: str = f"{icao_int:06X}"
+            self.icao = f"{icao_int:06X}"
         elif self._icao_hint is not None:
             self.icao = self._icao_hint
         else:
             # DF0/4/5/16/20/21: ICAO is the CRC remainder.
             self.icao = f"{self.crc:06X}"
         if self.df in (17, 18):
-            self.crc_valid: bool = self.crc == 0
+            self.crc_valid = self.crc == 0
+        elif self.df in (0, 4, 5, 16, 20, 21) and self._icao_hint is not None:
+            # Address-parity formats can only be checked against an ICAO known
+            # independently of the parity remainder. Without a hint, deriving
+            # the ICAO from that same remainder would make validation circular.
+            self.crc_valid = self.crc == int(self._icao_hint, 16)
         else:
-            # DF0/4/5/11/16/20/21: CRC encodes ICAO (+ optional BDS
-            # overlay); the remainder is always a valid 24-bit ICAO-
-            # shaped value. Stronger verification comes from the
-            # trusted-ICAO set in PipeDecoder via icao_verified.
-            self.crc_valid = self.df in (0, 4, 5, 11, 16, 20, 21)
+            # Address/interrogator parity does not provide an independent
+            # validity verdict by itself. PipeDecoder can separately mark an
+            # ICAO as verified after observing it in CRC-valid extended
+            # squitter traffic.
+            self.crc_valid = None
 
     @staticmethod
     def _parse_hex(hexstr: str) -> tuple[int, int]:
@@ -210,17 +252,21 @@ class Message:
         obj = cls.__new__(cls)
         obj._n = n
         obj._length = 112
+        obj._uplink = False
         # Treat the caller-supplied icao as an out-of-band hint so
         # decode() can surface icao_verified=True for DF20/21 and so
         # non-ADS-B DFs pick up the hint rather than a garbage CRC.
         obj._icao_hint = icao
         obj._init_header_fields()
+        # The payload-only constructor deliberately fills parity with zero, so
+        # it never represents a CRC-validated full message.
+        obj.crc_valid = False
         return obj
 
     @cached_property
     def typecode(self) -> int | None:
         """ADS-B type code (bits 32-36), only defined for DF17/18."""
-        if self.df not in (17, 18):
+        if self._uplink or self.df not in (17, 18):
             return None
         return extract_unsigned(self._n, 32, 5, self._length)
 
@@ -230,11 +276,12 @@ class Message:
         reference: tuple[float, float] | None = None,
         surface_ref: str | tuple[float, float] | None = None,
         known: dict[str, Any] | None = None,
+        include_meteo: bool = False,
         full_dict: bool = False,
     ) -> Decoded:
         """Decode every field of this message.
 
-        Returns a Decoded dict containing df, icao, crc_valid, and
+        Returns a Decoded dict containing df (uf for uplink), icao, crc_valid, and
         whatever DF-specific fields the appropriate decoder class
         extracts. For DF20/21 the dict also includes `icao_verified`
         (True when an `icao_hint` was supplied at construction time,
@@ -258,12 +305,30 @@ class Message:
                 Comm-B BDS inference to disambiguate BDS 5,0 vs 6,0
                 when both heuristic validators pass. Ignored for
                 non-Comm-B downlink formats.
+            include_meteo: When True, Comm-B inference also considers the
+                heuristic BDS 4,4 and 4,5 meteorological registers. Disabled
+                by default because their payloads can overlap other Comm-B
+                formats.
             full_dict: When True, the result dict is augmented with
                 every key from `_FULL_SCHEMA`, defaulting missing
                 keys to `None`. Useful for pandas/parquet workflows
                 that need a uniform shape across messages.
         """
-        result: Decoded = Decoded(
+        if self._uplink:
+            from pyModeS.decoder.uplink import Uplink
+
+            assert self.uf is not None
+            result = Decoded(uf=self.uf, icao=self.icao, crc_valid=self.crc_valid)
+            result.update(
+                Uplink(
+                    self._n, df=self.uf, icao=self.icao, length=self._length
+                ).decode()
+            )
+            if full_dict:
+                self._populate_full_dict(result)
+            return result
+
+        result = Decoded(
             {
                 "df": self.df,
                 "icao": self.icao,
@@ -279,7 +344,14 @@ class Message:
             decoder = decoder_cls(
                 self._n, df=self.df, icao=self.icao, length=self._length
             )
-            result.update(decoder.decode(known=known))
+            # Keep the common non-meteorological path free of an extra keyword
+            # dispatch. This matters for high-rate ADS-B streams, while the
+            # opt-in branch is relevant only to DF20/21 Comm-B decoders.
+            if include_meteo and self.df in (20, 21):
+                commb_decoder = cast("CommB", decoder)
+                result.update(commb_decoder.decode(known=known, include_meteo=True))
+            else:
+                result.update(decoder.decode(known=known))
 
         self._resolve_position(result, reference=reference, surface_ref=surface_ref)
 

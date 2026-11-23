@@ -4,11 +4,9 @@
 verifies the stream is Mode-S Beast binary format, parses frames into
 hex strings, and yields ``(hex_msg, timestamp)`` tuples.
 
-Only Mode-S Beast binary is supported — that covers dump1090's default
-port 30005, dump1090-fa, readsb, piaware, the AirSquitter receiver,
-and most modern Mode-S feeds. The legacy AVR raw text format (port
-30002) is out of scope for v3 and can be added later if a user
-requests it.
+Only Mode-S Beast binary is supported — that covers dump1090,
+dump1090-fa, readsb, piaware, the AirSquitter receiver,
+and most modern Mode-S feeds.
 
 Beast format (per Mode-S Beast wire protocol, cross-checked against
 FlightAware dump1090 ``net_io.c::modesReadFromClient``)::
@@ -28,12 +26,15 @@ FlightAware dump1090 ``net_io.c::modesReadFromClient``)::
 
 from __future__ import annotations
 
+import contextlib
 import socket
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 
 _DETECT_CAP = 16 * 1024  # give up on auto-detect after 16 KB
+_REMAINDER_CAP = 64 * 1024  # bound malformed/status-frame buffering
 
 # Beast body lengths: MLAT(6) + SIGNAL(1) + PAYLOAD
 _BODY_LEN_SHORT = 7 + 7  # type 0x32
@@ -56,12 +57,37 @@ _BODY_LEN_MODE_AC = 7 + 2  # type 0x31
 # bursts. See ``_rate_estimate`` in ``_read_loop``.
 _MLAT_HZ_DUMP1090: float = 12_000_000.0
 _MLAT_HZ_RADARCAPE: float = 1_000_000_000.0
+_MLAT_MODULUS: int = 1 << 48
+_RADARCAPE_DAY_TICKS: int = 86_400_000_000_000
+_KNOWN_MLAT_RATES: tuple[float, ...] = (
+    _MLAT_HZ_DUMP1090,
+    _MLAT_HZ_RADARCAPE,
+)
 
 # Minimum wall-clock delta between calibration samples — a new
 # rate estimate is only accepted when the two anchoring bursts
 # are spaced at least this far apart. Avoids dividing by tiny
 # jitter in the wall-clock timestamps.
 _CALIB_MIN_DELTA_S: float = 0.1
+_CALIB_RATE_TOLERANCE: float = 0.25
+
+
+def _forward_tick_delta(newer: int, older: int) -> int:
+    """Return forward ticks across a free-running or midnight-reset counter."""
+    if newer >= older:
+        return newer - older
+
+    candidates = [(newer - older) % _MLAT_MODULUS]
+    if older <= _RADARCAPE_DAY_TICKS:
+        candidates.append(_RADARCAPE_DAY_TICKS - older + newer)
+    return min(candidates)
+
+
+def _canonical_mlat_rate(observed_rate: float) -> float | None:
+    """Snap a noisy wall-clock estimate to a supported Beast counter rate."""
+    closest = min(_KNOWN_MLAT_RATES, key=lambda rate: abs(rate - observed_rate))
+    relative_error = abs(observed_rate - closest) / closest
+    return closest if relative_error <= _CALIB_RATE_TOLERANCE else None
 
 
 class UnsupportedStreamError(RuntimeError):
@@ -87,7 +113,9 @@ def _walk_body(buf: bytes, start: int, body_len: int) -> tuple[list[int], int]:
     first byte after the last consumed byte in ``buf``.
 
     If the buffer ends before ``body_len`` un-escaped bytes have been
-    collected, returns (partial_body, -1) to signal incompleteness.
+    collected, returns ``(partial_body, -1)``. If another unescaped frame
+    marker interrupts the body, ``next_index`` points at that marker so the
+    caller can discard the truncated frame and resynchronise immediately.
     """
     body: list[int] = []
     j = start
@@ -103,10 +131,10 @@ def _walk_body(buf: bytes, start: int, body_len: int) -> tuple[list[int], int]:
                 body.append(0x1A)
                 j += 2
                 continue
-            # Unescaped 0x1a mid-body means the frame is truncated
-            # and the 0x1a is the start of the next frame. Caller
-            # will treat the current frame as incomplete.
-            return body, -1
+            # Unescaped 0x1a mid-body means the frame is truncated and this
+            # byte starts the next frame. Returning its index lets the parser
+            # recover instead of retaining the corrupt prefix forever.
+            return body, j
         body.append(b)
         j += 1
     if len(body) < body_len:
@@ -132,10 +160,9 @@ def _parse_beast_buffer(buf: bytes) -> tuple[list[tuple[int, str]], bytes]:
 
     ``mlat_ticks`` is the big-endian 48-bit counter at the head of
     the beast body. Interpretation (unix time vs free-running) is
-    receiver-dependent; :class:`NetworkSource` anchors the first
-    frame's MLAT against ``time.time()`` and computes per-frame
-    wall-clock from the 12 MHz tick rate used by dump1090-compatible
-    feeds.
+    receiver-dependent; :class:`NetworkSource` calibrates the counter rate,
+    anchors the last frame in each receive burst to ``time.time()``, and
+    back-projects the earlier frames.
     """
     frames: list[tuple[int, str]] = []
     i = 0
@@ -144,6 +171,7 @@ def _parse_beast_buffer(buf: bytes) -> tuple[list[tuple[int, str]], bytes]:
     while i < len(buf):
         if buf[i] != 0x1A:
             i += 1
+            last_consumed = i
             continue
 
         # Potential frame start at buf[i]
@@ -164,6 +192,10 @@ def _parse_beast_buffer(buf: bytes) -> tuple[list[tuple[int, str]], bytes]:
             body, next_i = _walk_body(buf, i + 2, _BODY_LEN_MODE_AC)
             if next_i == -1:
                 break  # incomplete; keep remainder from i
+            if len(body) < _BODY_LEN_MODE_AC:
+                i = next_i
+                last_consumed = next_i
+                continue
             i = next_i
             last_consumed = next_i
             continue
@@ -185,9 +217,14 @@ def _parse_beast_buffer(buf: bytes) -> tuple[list[tuple[int, str]], bytes]:
             last_consumed = j
             continue
         else:
-            # Unknown type byte — advance past the escape and try
-            # again at the next byte.
-            i += 1
+            # Unknown marker type: discard both marker and type byte. Keeping
+            # the marker in the remainder would make an unknown-only stream
+            # grow without bound after format detection.
+            # Two consecutive markers can also arise when one recv() ends on
+            # a marker and the next starts with a complete frame. In that
+            # case retain the second marker as a possible new frame start.
+            i += 1 if msg_type == 0x1A else 2
+            last_consumed = i
             continue
 
         body, next_i = _walk_body(buf, i + 2, body_len)
@@ -195,6 +232,12 @@ def _parse_beast_buffer(buf: bytes) -> tuple[list[tuple[int, str]], bytes]:
             # Incomplete frame; keep remainder starting at i so the
             # next call can continue from this frame's 0x1a.
             break
+        if len(body) < body_len:
+            # A new unescaped marker interrupted this frame. Drop the corrupt
+            # prefix and retry from the marker returned by _walk_body().
+            i = next_i
+            last_consumed = next_i
+            continue
 
         # Body layout (after un-escape): MLAT(6) + SIG(1) + PAYLOAD.
         # The MLAT counter is big-endian 48-bit; NetworkSource turns
@@ -220,20 +263,17 @@ class NetworkSource:
 
     Usage::
 
-        src = NetworkSource("airsquitter.lr.tudelft.nl", 10006)
+        src = NetworkSource("localhost", 10006)
         for hex_msg, timestamp in src:
             ...
 
-    Iterator never terminates under normal operation — it reconnects
-    on dropped connections with exponential backoff. Caller is
-    responsible for interrupting via signal (Ctrl-C) or by raising
-    from the consuming loop.
+    The iterator reconnects on dropped connections with exponential backoff.
+    Call :meth:`close` to terminate it and unblock a pending socket read.
 
     If the initial read from the socket does not contain a beast
     marker byte (0x1a) within the first ``_DETECT_CAP`` bytes, the
-    iterator raises ``UnsupportedStreamError`` — the stream is either
-    legacy AVR raw text, a totally unrelated protocol, or a broken
-    feed.
+    iterator raises ``UnsupportedStreamError`` because the stream does
+    not contain valid Beast frames.
     """
 
     def __init__(
@@ -258,51 +298,82 @@ class NetworkSource:
         # rendered table.
         self.silent = silent
         self._sock: socket.socket | None = None
+        self._socket_lock = threading.Lock()
+        self._closed = False
+        self._close_event = threading.Event()
         self._buf: bytes = b""
         self._detected: bool = False
-        # MLAT-to-wall-clock calibration state. A per-recv() anchor
-        # (wall time + first-frame MLAT in the burst) drives per-
-        # frame interpolation within the burst; the rate is learned
-        # from the delta between consecutive bursts. Both reset on
-        # reconnect so the post-reconnect burst anchors freshly.
+        # MLAT-to-wall-clock calibration state. The last frame in each recv()
+        # burst is paired with the wall time observed after recv() completes;
+        # earlier frames are back-projected at a calibrated counter rate.
         self._prev_burst_wall: float | None = None
         self._prev_burst_mlat: int | None = None
         self._rate_estimate: float | None = None
 
     def __iter__(self) -> Iterator[tuple[str, float]]:
         backoff = 0.5
-        while True:
-            try:
-                self._connect()
-                backoff = 0.5  # reset on successful connect
-                yield from self._read_loop()
-            except UnsupportedStreamError:
-                raise
-            except (OSError, TimeoutError) as e:
-                if not self.silent:
-                    print(
-                        f"[pyModeS.live] connection dropped ({e}); "
-                        f"retrying in {backoff:.1f}s",
-                        file=sys.stderr,
-                    )
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 10.0)
-                self._detected = False
-                self._buf = b""
-                # New TCP connection → the receiver's MLAT epoch
-                # may be unrelated to the previous one (and on
-                # radarcape feeds may even change after midnight).
-                # Drop the calibration state so the next burst
-                # re-anchors.
-                self._prev_burst_wall = None
-                self._prev_burst_mlat = None
-                self._rate_estimate = None
+        try:
+            while not self._closed:
+                try:
+                    self._connect()
+                    backoff = 0.5  # reset on successful connect
+                    yield from self._read_loop()
+                except UnsupportedStreamError:
+                    raise
+                except (OSError, TimeoutError) as e:
+                    self._close_socket()
+                    if self._closed:
+                        break
+                    if not self.silent:
+                        print(
+                            f"[pyModeS.live] connection dropped ({e}); "
+                            f"retrying in {backoff:.1f}s",
+                            file=sys.stderr,
+                        )
+                    if self._close_event.wait(backoff):
+                        break
+                    backoff = min(backoff * 2, 10.0)
+                    self._detected = False
+                    self._buf = b""
+                    # New TCP connection → the receiver's MLAT epoch
+                    # may be unrelated to the previous one. Drop calibration
+                    # state so the next burst anchors freshly.
+                    self._prev_burst_wall = None
+                    self._prev_burst_mlat = None
+                    self._rate_estimate = None
+        finally:
+            self._close_socket()
 
     def _connect(self) -> None:
-        self._sock = socket.create_connection(
+        sock = socket.create_connection(
             (self.host, self.port), timeout=self.connect_timeout
         )
-        self._sock.settimeout(self.read_timeout)
+        sock.settimeout(self.read_timeout)
+        with self._socket_lock:
+            if self._closed:
+                sock.close()
+                raise OSError("network source is closed")
+            old_sock = self._sock
+            self._sock = sock
+        if old_sock is not None:
+            old_sock.close()
+
+    def _close_socket(self) -> None:
+        """Detach and close the current socket, if any."""
+        with self._socket_lock:
+            sock = self._sock
+            self._sock = None
+        if sock is not None:
+            with contextlib.suppress(AttributeError, OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+            sock.close()
+
+    def close(self) -> None:
+        """Stop iteration and close the socket, unblocking a pending recv()."""
+        with self._socket_lock:
+            self._closed = True
+        self._close_event.set()
+        self._close_socket()
 
     def _read_loop(self) -> Iterator[tuple[str, float]]:
         """Inner loop: read bytes, parse beast frames, yield (hex, ts).
@@ -310,22 +381,13 @@ class NetworkSource:
         Per-frame timestamp strategy:
 
         - Take ``wall_now = time.time()`` once per ``recv()`` burst.
-        - Use the first frame's MLAT in the burst as a local
-          anchor; every frame in the burst is then assigned
-          ``wall_now + (frame.mlat - first_mlat) / rate``. This
-          gives sub-microsecond within-burst precision (at 1 GHz
-          radarcape) or sub-100 ns precision (12 MHz dump1090),
-          both of which are much finer than what TCP batching
-          leaves us with if we just stamp ``time.time()`` once
-          per batch.
-        - ``rate`` is auto-calibrated against the delta between
-          consecutive burst anchors: ``(mlat_N - mlat_{N-1}) /
-          (wall_N - wall_{N-1})``. The very first burst has no
-          prior anchor, so all its frames fall back to
-          ``wall_now``; by the second burst onward, interpolation
-          kicks in. The estimator is receiver-agnostic — it works
-          the same for 12 MHz dump1090 counters and radarcape
-          nanosecond counters with no configuration.
+        - Anchor the last frame's MLAT to ``wall_now``. Every earlier frame is
+          back-projected from it, ensuring no frame that was already received
+          is assigned a future timestamp.
+        - Auto-calibrate against consecutive last-frame anchors and snap noisy
+          estimates to the known 12 MHz or 1 GHz Beast counter rates. Tick
+          deltas account for both 48-bit free-running rollover and Radarcape's
+          midnight reset.
         """
         assert self._sock is not None
         while True:
@@ -354,14 +416,17 @@ class NetworkSource:
 
             # Parse beast frames from the buffer
             frames, remainder = _parse_beast_buffer(self._buf)
-            self._buf = remainder
+            # A status frame with no following marker (or otherwise malformed
+            # input) can still leave an indeterminate remainder. Keep memory
+            # bounded while waiting for a future frame marker.
+            self._buf = remainder[-_REMAINDER_CAP:]
 
             if not frames:
                 continue
 
-            # Per-burst anchor: the first frame's MLAT pairs with
-            # wall_now. Interpolate later frames against that.
-            burst_anchor_mlat = frames[0][0]
+            # The last frame is closest in time to recv() completion. Anchor it
+            # to wall_now and back-project the frames that preceded it.
+            burst_anchor_mlat = frames[-1][0]
 
             # Update the rate estimate from the delta between this
             # burst's anchor and the previous one. Skip the very
@@ -369,15 +434,17 @@ class NetworkSource:
             # delta is too small to give a stable estimate.
             if self._prev_burst_wall is not None and self._prev_burst_mlat is not None:
                 dw = wall_now - self._prev_burst_wall
-                dm = burst_anchor_mlat - self._prev_burst_mlat
+                dm = _forward_tick_delta(burst_anchor_mlat, self._prev_burst_mlat)
                 if dw >= _CALIB_MIN_DELTA_S and dm > 0:
-                    self._rate_estimate = dm / dw
+                    calibrated = _canonical_mlat_rate(dm / dw)
+                    if calibrated is not None:
+                        self._rate_estimate = calibrated
             self._prev_burst_wall = wall_now
             self._prev_burst_mlat = burst_anchor_mlat 
             rate = self._rate_estimate
             for mlat, hex_msg in frames:
                 if rate is not None and rate > 0:
-                    ts = wall_now + (mlat - burst_anchor_mlat) / rate
+                    ts = wall_now - _forward_tick_delta(burst_anchor_mlat, mlat) / rate
                 else:
                     # Pre-calibration fallback: every frame in the
                     # burst gets the same wall_now reading. Lasts

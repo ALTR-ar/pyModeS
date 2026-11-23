@@ -133,6 +133,24 @@ class TestBeastParser:
         # parse call can complete it when more bytes arrive
         assert b"\x1a\x33" in remainder
 
+    def test_truncated_frame_resynchronises_at_next_marker(self):
+        from pyModeS.cli._source import _parse_beast_buffer
+
+        broken = b"\x1a\x33\x00\x00"
+        valid = self._make_long_frame("8D406B902015A678D4D220AA4BDA", mlat=123)
+        frames, remainder = _parse_beast_buffer(broken + valid + b"\x1a")
+
+        assert frames == [(123, "8D406B902015A678D4D220AA4BDA")]
+        assert remainder == b"\x1a"
+
+    def test_unknown_markers_do_not_accumulate(self):
+        from pyModeS.cli._source import _parse_beast_buffer
+
+        frames, remainder = _parse_beast_buffer(b"\x1a\x35" * 10_000)
+
+        assert frames == []
+        assert remainder == b""
+
     def test_skips_mode_ac_frames(self):
         from pyModeS.cli._source import _parse_beast_buffer
 
@@ -152,8 +170,8 @@ class TestMlatCalibration:
     """End-to-end tests for NetworkSource's MLAT-derived per-frame
     timestamps. The read-loop grabs ``time.time()`` once per recv()
     burst, auto-calibrates a tick rate from the delta between
-    consecutive burst anchors, and interpolates each frame in the
-    current burst against the burst's first-frame MLAT.
+    consecutive burst anchors, and back-projects each frame from the
+    current burst's last-frame MLAT.
 
     We drive ``_read_loop`` through a fake socket rather than spinning
     up a real TCP server — the bytes-in / frames-out contract is all
@@ -238,11 +256,12 @@ class TestMlatCalibration:
         assert captured[1][1] == 1000.0
 
     def test_second_burst_calibrates_to_12mhz_dump1090(self) -> None:
-        # Burst 1: anchor wall=1000, mlat=0
-        # Burst 2: anchor wall=1001, mlat=12e6 → rate = 12 MHz
-        #          second frame within burst 2 is 6e6 ticks further
-        #          → wall = 1001 + 6e6 / 12e6 = 1001.5
-        b1 = self._make_long_frame("8D406B902015A678D4D220AA4BDA", mlat=0) + b"\x1a"
+        # Burst 2's last frame anchors wall=1001. Its first frame is
+        # back-projected by 0.5 seconds at the calibrated 12 MHz rate.
+        b1 = (
+            self._make_long_frame("8D406B902015A678D4D220AA4BDA", mlat=6_000_000)
+            + b"\x1a"
+        )
         f1 = self._make_long_frame("8D485020994409940838175B284F", mlat=12_000_000)
         f2 = self._make_long_frame("8D40058B58C901375147EFD09357", mlat=18_000_000)
         b2 = f1 + f2 + b"\x1a"
@@ -250,23 +269,60 @@ class TestMlatCalibration:
         captured = self._run_bursts([b1, b2], wall_times=[1000.0, 1001.0])
         # burst 1: fallback wall_now
         assert captured[0][1] == 1000.0
-        # burst 2 frame 1: anchor to wall_now=1001.0
-        assert captured[1][1] == pytest.approx(1001.0, abs=1e-6)
-        # burst 2 frame 2: interpolate (rate from burst1→burst2 anchor pair)
-        assert captured[2][1] == pytest.approx(1001.5, abs=1e-6)
+        assert captured[1][1] == pytest.approx(1000.5, abs=1e-6)
+        assert captured[2][1] == pytest.approx(1001.0, abs=1e-6)
+        assert all(ts <= 1001.0 for _, ts in captured[1:])
 
     def test_second_burst_calibrates_to_1ghz_radarcape(self) -> None:
-        # Burst 1: anchor wall=1000, mlat=0
-        # Burst 2: anchor wall=1001, mlat=1e9 → rate = 1 GHz
-        #          second frame 500e6 ticks further → wall = 1001.5
-        b1 = self._make_long_frame("8D406B902015A678D4D220AA4BDA", mlat=0) + b"\x1a"
+        # Burst 2's last frame anchors wall=1001 and its first frame is
+        # back-projected by 0.5 seconds at the calibrated 1 GHz rate.
+        b1 = (
+            self._make_long_frame("8D406B902015A678D4D220AA4BDA", mlat=500_000_000)
+            + b"\x1a"
+        )
         f1 = self._make_long_frame("8D485020994409940838175B284F", mlat=1_000_000_000)
         f2 = self._make_long_frame("8D40058B58C901375147EFD09357", mlat=1_500_000_000)
         b2 = f1 + f2 + b"\x1a"
 
         captured = self._run_bursts([b1, b2], wall_times=[1000.0, 1001.0])
-        assert captured[1][1] == pytest.approx(1001.0, abs=1e-6)
-        assert captured[2][1] == pytest.approx(1001.5, abs=1e-6)
+        assert captured[1][1] == pytest.approx(1000.5, abs=1e-6)
+        assert captured[2][1] == pytest.approx(1001.0, abs=1e-6)
+
+    def test_48_bit_rollover_is_forward_projected(self) -> None:
+        modulus = 1 << 48
+        b1 = (
+            self._make_long_frame(
+                "8D406B902015A678D4D220AA4BDA", mlat=modulus - 12_000_000
+            )
+            + b"\x1a"
+        )
+        f1 = self._make_long_frame(
+            "8D485020994409940838175B284F", mlat=modulus - 6_000_000
+        )
+        f2 = self._make_long_frame("8D40058B58C901375147EFD09357", mlat=0)
+
+        captured = self._run_bursts([b1, f1 + f2 + b"\x1a"], [1000.0, 1001.0])
+
+        assert captured[1][1] == pytest.approx(1000.5, abs=1e-6)
+        assert captured[2][1] == pytest.approx(1001.0, abs=1e-6)
+
+    def test_radarcape_midnight_reset_is_forward_projected(self) -> None:
+        day_ticks = 86_400_000_000_000
+        b1 = (
+            self._make_long_frame(
+                "8D406B902015A678D4D220AA4BDA", mlat=day_ticks - 1_000_000_000
+            )
+            + b"\x1a"
+        )
+        f1 = self._make_long_frame(
+            "8D485020994409940838175B284F", mlat=day_ticks - 500_000_000
+        )
+        f2 = self._make_long_frame("8D40058B58C901375147EFD09357", mlat=0)
+
+        captured = self._run_bursts([b1, f1 + f2 + b"\x1a"], [1000.0, 1001.0])
+
+        assert captured[1][1] == pytest.approx(1000.5, abs=1e-6)
+        assert captured[2][1] == pytest.approx(1001.0, abs=1e-6)
 
     def test_reconnect_resets_calibration_state(self) -> None:
         from pyModeS.cli._source import NetworkSource
@@ -285,3 +341,54 @@ class TestMlatCalibration:
         assert src._prev_burst_wall is None
         assert src._prev_burst_mlat is None
         assert src._rate_estimate is None
+
+
+class TestNetworkSourceLifecycle:
+    class _FakeSocket:
+        def __init__(self) -> None:
+            self.shutdown_called = False
+            self.closed = False
+
+        def settimeout(self, timeout: float) -> None:
+            pass
+
+        def shutdown(self, how: int) -> None:
+            self.shutdown_called = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    def test_close_unblocks_and_closes_socket(self) -> None:
+        from pyModeS.cli._source import NetworkSource
+
+        source = NetworkSource("fake", 1)
+        sock = self._FakeSocket()
+        source._sock = sock  # type: ignore[assignment]
+
+        source.close()
+
+        assert source._closed is True
+        assert source._close_event.is_set()
+        assert source._sock is None
+        assert sock.shutdown_called is True
+        assert sock.closed is True
+
+    def test_reconnect_closes_previous_socket(self, monkeypatch) -> None:
+        import pyModeS.cli._source as source_mod
+
+        source = source_mod.NetworkSource("fake", 1)
+        first = self._FakeSocket()
+        second = self._FakeSocket()
+        sockets = iter((first, second))
+        monkeypatch.setattr(
+            source_mod.socket,
+            "create_connection",
+            lambda *args, **kwargs: next(sockets),
+        )
+
+        source._connect()
+        source._connect()
+
+        assert first.closed is True
+        assert source._sock is second
+        source.close()

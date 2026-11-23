@@ -6,6 +6,10 @@ ambiguity, malformed payloads, etc. Each entry keeps the raw hex plus a
 few neighbouring messages so you can replay them through the decoder
 and reason about what went wrong.
 
+Most entries come from captured traffic. Cases explicitly labelled
+**synthetic regression vector** isolate a protocol boundary that is difficult
+to reproduce safely from a live feed.
+
 Use this as a reference when:
 
 - debugging a surprising decode output;
@@ -98,7 +102,7 @@ contributor but can produce the same signature.
 
 ### How PipeDecoder handles it
 
-Since 3.3.0, `PipeDecoder._reject_velocity_mismatch` cross-checks each
+The `PipeDecoder` validation layer cross-checks each
 CRC-valid DF17/18 TC=19 frame against the per-ICAO velocity anchor
 (`_adsb_velocity[icao] = (timestamp, groundspeed, track)`) populated
 from previously-accepted TC=19 frames. Tolerances scale with the gap
@@ -153,26 +157,24 @@ of each other:
 12:44:21.950  DF=17 TC=11  F=0   8D485A33580592E162F2A2BAE957   alt=  25
 12:44:22.913  DF=17 TC=11  F=1   8D485A335805B64CAAEBE6E13238   alt=  75   <-- 2nd pair resolves
 12:44:23.385  DF=17 TC=11  F=0   8D485A335805B2E18AF2A490B664   alt=  75
-12:44:24.009  DF=17 TC=11  F=1   8D485A335805C64CC8EBE6A65861   alt= 100   <-- 3rd pair resolves
+12:44:24.009  DF=17 TC=11  F=1   8D485A335805C64CC8EBE6A65861   alt= 100   <-- 3rd pair resolves, lock fires
 12:44:24.457  DF=17 TC=11  F=0   8D485A335805D2E1ACF2A45AD98B   alt= 125
 12:44:24.849  DF=17 TC=11  F=1   8D485A335805E64CE4EBE7247A8D   alt= 150   <-- 4th pair resolves
 12:44:25.323  DF=17 TC=11  F=1   8D485A335805F64CF2EBE81ACBB3   alt= 175
 12:44:25.778  DF=17 TC=11  F=1   8D485A335805F64CFEEBE84338BF   alt= 175
-12:44:26.322  DF=17 TC=11  F=0   8D485A33580702E1E4F2A623AB8E   alt= 200   <-- 5th pair resolves, lock fires
+12:44:26.322  DF=17 TC=11  F=0   8D485A33580702E1E4F2A623AB8E   alt= 200   <-- 5th pair resolves
 ```
 
-Each of the first five resolved pairs produces a bootstrap candidate:
+The first three resolved pairs produce a pairwise-consistent bootstrap cluster:
 
 ```text
 candidate #1  12:44:20.982   (52.3200, 4.7390)
 candidate #2  12:44:22.913   (52.3212, 4.7390)
 candidate #3  12:44:24.009   (52.3219, 4.7390)
-candidate #4  12:44:24.849   (52.3226, 4.7391)
-candidate #5  12:44:26.322   (52.3236, 4.7392)
 ```
 
-All five lie within ~400 m of each other along runway 18L — a
-motion-consistent cluster. On the fifth arrival `_bootstrap_try_lock`
+All three lie within ~250 m of each other along runway 18L — a
+pairwise motion-consistent cluster. On the third arrival `_bootstrap_try_lock`
 promotes the whole cluster into `_position_history`, retro-fills
 `latitude`/`longitude` on every held result dict — typically two per
 candidate, one for each half of the CPR pair — and subsequent positions
@@ -205,25 +207,29 @@ corroboration before committing to an anchor.
 - sets `latitude`/`longitude` to `None` on every held dict so
   unverified positions are never emitted to the caller;
 - increments `_stats["bootstrap_held"]`;
-- on reaching `_BOOTSTRAP_K = 5`, calls `_bootstrap_try_lock`.
+- once at least three candidates exist, calls `_bootstrap_try_lock` and locks
+  when every pair in a three-member subset is motion-consistent;
+- resets after `_BOOTSTRAP_MAX_CANDIDATES = 5` candidates if no such subset
+  forms.
 
 `_bootstrap_try_lock`:
 
-- runs an O(K²) neighbour scan: for each candidate count how many
-  others are reachable under `_pair_consistent` (same helper as the
-  steady-state motion check);
-- picks the candidate with the most neighbours;
-- if it has **zero** neighbours, returns `False` → caller clears the
-  buffer and increments `_stats["bootstrap_reset"]` (all K were
-  scattered phantoms; start fresh);
-- otherwise, promotes that candidate plus its neighbours, retro-fills
+- checks candidate subsets from largest to smallest. The buffer is capped at
+  five, so an exhaustive pairwise check is small and avoids a central point
+  incorrectly joining two mutually-inconsistent neighbours;
+- if no three-member pairwise-consistent subset exists during live decoding,
+  returns `False`; at five candidates the caller clears the buffer and
+  increments `_stats["bootstrap_reset"]`;
+- otherwise, promotes the largest consistent subset, retro-fills
   `latitude`/`longitude` on every held result dict for each cluster
   member, seeds the last `_POSITION_HISTORY_SIZE` members into
   `_position_history`, and clears the bootstrap buffer.
 
 `flush()` runs the same cluster analysis at end-of-stream for any
 ICAO still in bootstrap — useful for batch consumers that finish with
-fewer than K candidates.
+fewer than three candidates. Promotion also initializes the latest accepted
+airborne position as the local CPR reference, so decoding may safely continue
+after `flush()`.
 
 ### Reproduce
 
@@ -244,7 +250,7 @@ pipe._bootstrap["485A33"] = [
     (52.3226, 4.7391, 1004.849, [results[8],  results[9]]),
     (52.3236, 4.7392, 1006.322, [results[10], results[11]]),
 ]
-assert pipe._bootstrap_try_lock("485A33", min_candidates=5) is True
+assert pipe._bootstrap_try_lock("485A33", min_cluster_size=3) is True
 
 # The five Schiphol pairs (10 dicts) were retro-filled; the phantom
 # pair's two dicts were not.
@@ -310,7 +316,7 @@ the altitude-code bits and CPR bits are completely rewritten.
 
 ### Handling
 
-Since this change, `PipeDecoder._reject_df17_altitude_mismatch` runs
+The `PipeDecoder` validation layer runs
 the same altitude cross-check used for DF20 (see the DF20 entry below),
 but for CRC-valid DF17/18 BDS 0,5 frames:
 
@@ -553,9 +559,10 @@ buffer and fails to find any entry within
 The stream also shows an **altitude ghost** (TC=12 frames decoding to
 4075 ft while the aircraft is at 7400–7475 ft) interleaved with the
 real positions — same CRC-collision mechanism, different manifestation.
-Those don't trip the motion check because the raw stream sample is
-spatially close; the altitude mismatch stays in the position's BDS 0,5
-payload and passes through today.
+They do not necessarily trip the spatial motion check because their CPR
+coordinates may remain nearby. The current DF17/18 altitude check catches
+them earlier: with a recent 7400–7475 ft ADS-B anchor, it sets
+`altitude_mismatch=True` and clears the CPR fields before they can pair.
 
 ### Handling
 
@@ -576,6 +583,10 @@ On rejection:
    rotate the history toward reality rather than locking the decoder
    out forever.
 
+This recovery history is not the local CPR reference. Rejected global
+candidates never enter `_airborne_position_reference`, so they cannot poison
+subsequent locally-unambiguous airborne decoding.
+
 For the first few samples of a new ICAO (before the ring buffer is
 locked), candidates live in `_bootstrap[icao]` instead and go through
 the cluster-analysis step in `_bootstrap_try_lock`.
@@ -595,6 +606,88 @@ pipe._position_history["484164"] = [
 ]
 # A candidate in Hamburg is unreachable in the elapsed seconds.
 assert pipe._motion_consistent("484164", 53.765, 9.624, 1000.0) is False
+```
+
+---
+
+## DF20 BDS 4,4 — explicit meteorological opt-in
+
+**Case:** a routine meteorological report has a valid BDS 4,4 payload pattern,
+but default decoding intentionally does not classify it.
+
+- **Message:** `A0001692185BD5CF400000DFC696`
+- **Header decode:** DF20, derived ICAO `3C4DD7`, altitude 35 050 ft
+- **Opt-in decode:** BDS 4,4, wind 22 kt at 344.53°, static air temperature
+  −48.75 °C
+
+### Why opt-in is required
+
+BDS 4,4 and 4,5 have no explicit register identifier in the Comm-B payload.
+They are inferred from status bits and value ranges that can also occur in
+other traffic. Enabling them globally would therefore turn some unrelated
+Comm-B messages into false meteorological reports.
+
+The default result keeps the independently decoded DF20 header fields but does
+not add a BDS classification. `include_meteo=True` adds BDS 4,4/4,5 to the
+heuristic candidate set. This is appropriate for a feed known to contain
+meteorological reports, and remains a deliberate per-decoder choice.
+
+### Reproduce
+
+```python
+import pyModeS
+
+msg = "A0001692185BD5CF400000DFC696"
+
+default = pyModeS.decode(msg)
+assert default.get("bds") is None
+
+meteo = pyModeS.decode(msg, include_meteo=True)
+assert meteo["bds"] == "4,4"
+assert meteo["wind_speed"] == 22
+assert meteo["static_air_temperature"] == -48.75
+
+pipe = pyModeS.PipeDecoder(include_meteo=True)
+assert pipe.decode(msg)["bds"] == "4,4"
+```
+
+---
+
+## Surface CPR at the equator and date line
+
+**Case:** **synthetic regression vectors** exercise the two circular boundaries
+where a naïve surface-CPR reference comparison chooses the wrong zone.
+
+Surface CPR is ambiguous across two 90° latitude zones and four 90° longitude
+quadrants. Selecting latitude only from the reference's hemisphere fails when
+the aircraft and nearby reference straddle the equator. Comparing longitude
+with ordinary subtraction fails at the date line because −180° is only 1° from
+a +179° reference, not 359° away.
+
+The resolver now evaluates both latitude-zone candidates by distance to the
+reference and compares longitude circularly.
+
+### Reproduce
+
+```python
+from pyModeS.position import surface_position_pair
+
+# At the equator, zero-valued CPR resolves to the zero-degree zone rather than
+# defaulting to the southern 90-degree zone.
+assert surface_position_pair(
+    0, 0, 0, 0,
+    lat_ref=0.0,
+    lon_ref=0.0,
+    even_is_newer=True,
+) == (0.0, 0.0)
+
+# Around the date line, -180° is the closest quadrant to +179°.
+assert surface_position_pair(
+    0, 0, 0, 0,
+    lat_ref=1.0,
+    lon_ref=179.0,
+    even_is_newer=True,
+) == (0.0, -180.0)
 ```
 
 ---
@@ -623,7 +716,10 @@ surrounding BDS 6,0 stream.
 
 ### Why it's hard
 
-Three checks were tried and rejected:
+Three checks were tried experimentally and rejected. These thresholds are not
+active validation rules. The current decoder uses magnetic heading for the
+dedicated BDS 6,0 plausibility check; IAS and Mach contribute to ambiguity
+scoring, but do not trigger hard rejection.
 
 1. **Mach smoothness against per-ICAO state.** Real Mach changes by up
    to 0.13 over ~30 s during cruise-to-IAS-transition descent; a
@@ -633,13 +729,12 @@ Three checks were tried and rejected:
    Phantom Mach-IAS pair differed from the gs-derived expectation by
    only 0.092 — well inside the 0.20 tolerance needed to accommodate
    ±100 kt of real-world wind.
-3. **Mach-IAS internal consistency at the anchor altitude.** The
+3. **Mach-IAS internal consistency at the anchor altitude.** The prototype
    phantom's `(Mach 0.78, IAS 316)` evaluated at the anchor's 2400 ft
    produces a TAS-from-Mach of ~338 kt vs TAS-from-IAS of ~295 kt —
-   a 43 kt disagreement, just above the 40 kt threshold used for
-   cruise-phase checks. But lowering the altitude floor that enables
-   this check (currently `> 500 ft`) any further starts rejecting
-   real late-descent traffic, and tightening the 40 kt bound
+   a 43 kt disagreement, just above its experimental 40 kt threshold.
+   Lowering the experiment's `> 500 ft` altitude floor further started
+   rejecting real late-descent traffic, and tightening the 40 kt bound
    false-positives in the presence of large wind changes.
 
 The signal that would reliably catch this pathology is *interrogator

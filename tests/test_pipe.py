@@ -18,6 +18,7 @@ class TestPipeDecoderSkeleton:
             "altitude_mismatch": 0,
             "velocity_mismatch": 0,
             "position_rejected": 0,
+            "local_positions": 0,
             "bootstrap_held": 0,
             "bootstrap_reset": 0,
         }
@@ -64,6 +65,7 @@ class TestPipeDecoderSkeleton:
             "altitude_mismatch": 0,
             "velocity_mismatch": 0,
             "position_rejected": 0,
+            "local_positions": 0,
             "bootstrap_held": 0,
             "bootstrap_reset": 0,
         }
@@ -84,6 +86,12 @@ class TestPipeDecoderSkeleton:
         for key in _FULL_SCHEMA:
             assert key in result
 
+    def test_include_meteo_propagates_to_decode(self):
+        pipe = PipeDecoder(include_meteo=True)
+        result = pipe.decode("A0001692185BD5CF400000DFC696", timestamp=1.0)
+        assert result["bds"] == "4,4"
+        assert result["wind_speed"] == 22
+
 
 class TestKnownKwargPlumbing:
     def test_message_decode_accepts_known(self):
@@ -102,6 +110,19 @@ class TestKnownKwargPlumbing:
 
 
 class TestStateTracking:
+    def test_timestamp_without_tracked_fields_does_not_create_state(self):
+        pipe = PipeDecoder()
+        # Identification has no fields used for downstream BDS 5,0/6,0
+        # disambiguation. A timestamp alone must not create cache state.
+        pipe.decode("8D406B902015A678D4D220AA4BDA", timestamp=1000.0)
+        assert "406B90" not in pipe._state
+
+    def test_untracked_message_refreshes_existing_state(self):
+        pipe = PipeDecoder()
+        pipe._state["406B90"] = {"groundspeed": 400, "_last_seen": 900.0}
+        pipe.decode("8D406B902015A678D4D220AA4BDA", timestamp=1000.0)
+        assert pipe._state["406B90"]["_last_seen"] == 1000.0
+
     def test_state_populated_after_velocity_decode(self):
         pipe = PipeDecoder()
         # DF17 BDS 0,9 ground velocity message — populates groundspeed and track
@@ -157,11 +178,19 @@ class TestStateTracking:
         state = pipe._state["485020"]
         assert state.get("_last_seen") == 2000.0
 
-    def test_known_none_when_state_only_has_housekeeping(self, monkeypatch):
+    def test_older_message_does_not_regress_state_timestamp(self):
+        pipe = PipeDecoder()
+        pipe.decode("8D485020994409940838175B284F", timestamp=2000.0)
+        state_before = dict(pipe._state["485020"])
+
+        pipe.decode("8D485020994409940838175B284F", timestamp=1000.0)
+
+        assert pipe._state["485020"] == state_before
+
+    def test_known_none_when_message_has_no_tracked_state(self, monkeypatch):
         # A BDS 0,8 identification message emits no field in
-        # `_DECODED_TO_KNOWN`, so the first decode leaves state with
-        # only `_last_seen`. The second decode filters out that key
-        # and passes `known=None` to Message.decode (not an empty dict).
+        # `_DECODED_TO_KNOWN`, so it creates no state. Repeated decodes
+        # therefore pass `known=None` to Message.decode.
         from pyModeS import Message
 
         captured: list[dict | None] = []
@@ -176,11 +205,10 @@ class TestStateTracking:
         # First decode: BDS 0,8 identification — emits callsign,
         # category, wake_vortex, none of which are in _DECODED_TO_KNOWN.
         pipe.decode("8D406B902015A678D4D220AA4BDA", timestamp=1000.0)
-        state = pipe._state["406B90"]
-        # Confirm the state only contains the _last_seen housekeeping key
-        assert set(state.keys()) == {"_last_seen"}
+        assert "406B90" not in pipe._state
         # Second decode, same ICAO: known must be None (not {})
         pipe.decode("8D406B902015A678D4D220AA4BDA", timestamp=1001.0)
+        assert captured[0] is None
         assert captured[1] is None
 
 
@@ -305,15 +333,28 @@ class TestIcaoVerification:
         # DF20 vector below). This avoids needing a paired real DF17
         # vector — we're testing the verification logic, not the
         # population logic, which is covered by the next test.
-        pipe._trusted_icaos.add("4243D0")
+        pipe._trusted_icaos["4243D0"] = 1000.0
         result = pipe.decode("a000029cffbaa11e2004727281f1", timestamp=1001.0)
         assert result["icao_verified"] is True
+
+    def test_df20_not_verified_after_trust_expires(self):
+        pipe = PipeDecoder(eviction_ttl=10.0)
+        pipe._trusted_icaos["4243D0"] = 1000.0
+
+        result = pipe.decode("a000029cffbaa11e2004727281f1", timestamp=1011.0)
+
+        assert result["icao_verified"] is False
 
     def test_trusted_set_populated_by_df17(self):
         pipe = PipeDecoder()
         # Any clean DF17 message populates the trusted set with its ICAO
         pipe.decode("8D406B902015A678D4D220AA4BDA", timestamp=1000.0)
         assert "406B90" in pipe._trusted_icaos
+
+    def test_trust_requires_timestamped_observation(self):
+        pipe = PipeDecoder()
+        pipe.decode("8D406B902015A678D4D220AA4BDA")
+        assert "406B90" not in pipe._trusted_icaos
 
     def test_trusted_set_not_populated_by_failing_crc(self):
         pipe = PipeDecoder()
@@ -743,12 +784,11 @@ class TestBothPairFramesCarryPosition:
         pipe = PipeDecoder()
         first_frames = []
         second_frames = []
-        for i in range(5):
+        for i in range(3):
             first_frames.append(pipe.decode(self.PAIR_A, timestamp=1000.0 + 2 * i))
             second_frames.append(pipe.decode(self.PAIR_B, timestamp=1001.0 + 2 * i))
-        # After the 5th pair the cluster locks and retro-fill runs over
-        # every cluster member's held dicts — that's both halves of all
-        # five pairs.
+        # The third pair completes the bootstrap cluster. Promotion updates
+        # both result dictionaries retained for each of the three pairs.
         assert "40058B" in pipe._position_history
         for r in first_frames + second_frames:
             assert r["latitude"] == pytest.approx(49.81755, abs=0.001)
@@ -757,7 +797,7 @@ class TestBothPairFramesCarryPosition:
     def test_superseded_same_parity_frame_retrofilled(self):
         """Two F=0 frames arrive before any F=1. Under the old single-
         entry pending, the first F=0 was orphaned (result dict returned
-        with latitude=None, never retro-filled). The pending deque pairs
+        with latitude=None, never retro-filled). The pending list pairs
         the arriving F=1 with EVERY fresh same-parity entry so both F=0
         frames get a lat/lon.
         """
@@ -828,6 +868,92 @@ class TestCprPairAccumulation:
         # 10s gap > 2s window — no pair resolution
         assert "latitude" not in result
 
+    def test_local_cpr_fills_current_frame_after_global_seed(self):
+        from pyModeS.position import airborne_position_with_ref
+
+        pipe = PipeDecoder()
+        pipe._position_history["40058B"] = list(self.ICAO_40058B_SEED)
+        pipe._airborne_position_reference["40058B"] = self.ICAO_40058B_SEED[-1]
+
+        result = pipe.decode(
+            "8D40058B58C901375147EFD09357",
+            timestamp=1446332400.0,
+        )
+        expected = airborne_position_with_ref(
+            result["cpr_format"],
+            result["cpr_lat"],
+            result["cpr_lon"],
+            self.ICAO_40058B_SEED[-1][0],
+            self.ICAO_40058B_SEED[-1][1],
+        )
+        assert result["latitude"] == pytest.approx(expected[0])
+        assert result["longitude"] == pytest.approx(expected[1])
+        assert pipe.stats["local_positions"] == 1
+
+    def test_bootstrap_seed_enables_local_position_on_next_frame(self):
+        pipe = PipeDecoder()
+        for i in range(3):
+            pipe.decode(
+                "8D40058B58C901375147EFD09357",
+                timestamp=1000.0 + 2 * i,
+            )
+            pipe.decode(
+                "8D40058B58C904A87F402D3B8C59",
+                timestamp=1001.0 + 2 * i,
+            )
+
+        result = pipe.decode(
+            "8D40058B58C901375147EFD09357",
+            timestamp=1006.0,
+        )
+        assert result["latitude"] == pytest.approx(49.82410, abs=0.001)
+        assert result["longitude"] == pytest.approx(6.06785, abs=0.001)
+        assert pipe.stats["local_positions"] == 1
+
+    def test_local_cpr_does_not_use_stale_reference(self):
+        pipe = PipeDecoder(local_ref_window=30.0)
+        pipe._position_history["40058B"] = list(self.ICAO_40058B_SEED)
+        pipe._airborne_position_reference["40058B"] = self.ICAO_40058B_SEED[-1]
+
+        result = pipe.decode(
+            "8D40058B58C901375147EFD09357",
+            timestamp=1446332430.1,
+        )
+        assert result.get("latitude") is None
+        assert pipe.stats["local_positions"] == 0
+
+    def test_local_cpr_can_be_disabled(self):
+        pipe = PipeDecoder(local_ref_window=0.0)
+        pipe._position_history["40058B"] = list(self.ICAO_40058B_SEED)
+        pipe._airborne_position_reference["40058B"] = self.ICAO_40058B_SEED[-1]
+
+        result = pipe.decode(
+            "8D40058B58C901375147EFD09357",
+            timestamp=1446332400.0,
+        )
+        assert result.get("latitude") is None
+        assert pipe.stats["local_positions"] == 0
+
+    def test_rejected_global_pair_does_not_fall_back_to_local(self):
+        pipe = PipeDecoder()
+        pipe._position_history["40058B"] = [
+            (70.0, -40.0, 990.0),
+            (70.1, -40.1, 995.0),
+        ]
+        pipe.decode("8D40058B58C901375147EFD09357", timestamp=1000.0)
+        pipe._airborne_position_reference["40058B"] = (70.1, -40.1, 995.0)
+        result = pipe.decode(
+            "8D40058B58C904A87F402D3B8C59",
+            timestamp=1001.0,
+        )
+        assert result.get("latitude") is None
+        assert pipe.stats["local_positions"] == 0
+        assert pipe._airborne_position_reference["40058B"] == (
+            70.1,
+            -40.1,
+            995.0,
+        )
+
     def test_single_frame_no_pair_keeps_raw_cpr(self):
         pipe = PipeDecoder()
         result = pipe.decode("8D40058B58C901375147EFD09357", timestamp=1000.0)
@@ -866,11 +992,25 @@ class TestCprPairAccumulation:
         assert result["latitude"] == pytest.approx(43.62646, abs=0.001)
         assert result["longitude"] == pytest.approx(1.37476, abs=0.001)
 
-    def test_same_parity_appends_to_deque(self):
+    def test_ground_reference_never_seeds_airborne_local_cpr(self):
+        pipe = PipeDecoder(surface_ref="LFBO")
+        for i in range(5):
+            pipe.decode(
+                "903a23ff426a38565950432ebf95",
+                timestamp=float(2 * i),
+            )
+            pipe.decode(
+                "903a23ff426a4e65f7487a775d17",
+                timestamp=float(2 * i + 1),
+            )
+        assert "3A23FF" in pipe._position_history
+        assert "3A23FF" not in pipe._airborne_position_reference
+
+    def test_same_parity_appends_to_pending_list(self):
         pipe = PipeDecoder()
         pipe.decode("8D40058B58C901375147EFD09357", timestamp=1000.0)
         # Decode another even frame from the same ICAO — pending is a
-        # deque per parity, so both entries accumulate (they'll both
+        # list per parity, so both entries accumulate (they'll both
         # get paired against the next opposite-parity arrival).
         pipe.decode("8D40058B58C901375147EFD09357", timestamp=1001.0)
         assert pipe.stats["pending_pairs"] == 2
@@ -898,6 +1038,30 @@ class TestCprPairAccumulation:
         # even_is_newer=True resolution
         assert result["latitude"] == pytest.approx(49.82410, abs=0.001)
         assert result["longitude"] == pytest.approx(6.06785, abs=0.001)
+
+    def test_pair_uses_timestamps_when_arrival_is_out_of_order(self):
+        pipe = PipeDecoder()
+        pipe._position_history["40058B"] = list(self.ICAO_40058B_SEED)
+        newer_odd = pipe.decode(
+            "8D40058B58C904A87F402D3B8C59",
+            timestamp=1446332405.0,
+        )
+        older_even = pipe.decode(
+            "8D40058B58C901375147EFD09357",
+            timestamp=1446332400.0,
+        )
+
+        for result in (newer_odd, older_even):
+            assert result["latitude"] == pytest.approx(49.81755, abs=0.001)
+            assert result["longitude"] == pytest.approx(6.08442, abs=0.001)
+        assert pipe._position_history["40058B"][-1][2] == 1446332405.0
+
+    def test_position_history_remains_timestamp_ordered(self):
+        pipe = PipeDecoder()
+        for timestamp in (3.0, 1.0, 2.0):
+            pipe._update_position_history("ABCDEF", 1.0, 2.0, timestamp)
+
+        assert [p[2] for p in pipe._position_history["ABCDEF"]] == [1.0, 2.0, 3.0]
 
     def test_surface_pair_without_surface_ref_skips_resolution(self):
         # When a surface CPR (BDS 0,6) pair is eligible but the decoder
@@ -936,6 +1100,63 @@ class TestCprPairAccumulation:
 
 
 class TestEviction:
+    class CountingPipe(PipeDecoder):
+        __slots__ = ("sweeps",)
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.sweeps = 0
+
+        def _evict_expired(self, now):
+            self.sweeps += 1
+            super()._evict_expired(now)
+
+    def test_sweep_is_throttled_within_default_interval(self):
+        pipe = self.CountingPipe()
+        for i in range(100):
+            pipe.decode(
+                "8D406B902015A678D4D220AA4BDA",
+                timestamp=1000.0 + i / 1000,
+            )
+        assert pipe.sweeps == 1
+
+    def test_sweep_runs_again_when_interval_is_due(self):
+        pipe = self.CountingPipe(eviction_interval=1.0)
+        for timestamp in (1000.0, 1000.999, 1001.0, 1001.5, 1002.0):
+            pipe.decode("8D406B902015A678D4D220AA4BDA", timestamp=timestamp)
+        assert pipe.sweeps == 3
+
+    def test_zero_interval_preserves_sweep_per_message_behavior(self):
+        pipe = self.CountingPipe(eviction_interval=0.0)
+        for timestamp in (1000.0, 1000.1, 1000.2):
+            pipe.decode("8D406B902015A678D4D220AA4BDA", timestamp=timestamp)
+        assert pipe.sweeps == 3
+
+    def test_interval_is_capped_at_short_ttl(self):
+        pipe = self.CountingPipe(eviction_ttl=0.1, eviction_interval=1.0)
+        for timestamp in (1000.0, 1000.05, 1000.1):
+            pipe.decode("8D406B902015A678D4D220AA4BDA", timestamp=timestamp)
+        assert pipe.sweeps == 2
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"eviction_ttl": -1.0}, "eviction_ttl must be >= 0"),
+            ({"eviction_interval": -1.0}, "eviction_interval must be >= 0"),
+            ({"local_ref_window": -1.0}, "local_ref_window must be >= 0"),
+        ],
+    )
+    def test_negative_eviction_configuration_rejected(self, kwargs, message):
+        with pytest.raises(ValueError, match=message):
+            PipeDecoder(**kwargs)
+
+    def test_reset_restarts_eviction_schedule(self):
+        pipe = self.CountingPipe()
+        pipe.decode("8D406B902015A678D4D220AA4BDA", timestamp=1000.0)
+        pipe.reset()
+        pipe.decode("8D406B902015A678D4D220AA4BDA", timestamp=1000.1)
+        assert pipe.sweeps == 2
+
     def test_old_pending_pair_evicted(self):
         pipe = PipeDecoder(eviction_ttl=10.0, pair_window=10.0)
         pipe.decode("8D40058B58C901375147EFD09357", timestamp=0.0)
@@ -968,14 +1189,13 @@ class TestEviction:
         pipe.decode("8D406B902015A678D4D220AA4BDA")
         assert "485020" in pipe._state
 
-    def test_trusted_icaos_not_evicted(self):
-        # The trusted set is permanent — no TTL applied
+    def test_trusted_icaos_are_evicted(self):
         pipe = PipeDecoder(eviction_ttl=10.0)
         pipe.decode("8D406B902015A678D4D220AA4BDA", timestamp=0.0)
         assert "406B90" in pipe._trusted_icaos
         # 1000s later
         pipe.decode("8D485020994409940838175B284F", timestamp=1000.0)
-        assert "406B90" in pipe._trusted_icaos
+        assert "406B90" not in pipe._trusted_icaos
 
     def test_same_icao_stale_state_wiped_before_refresh(self):
         # When an ICAO's state is older than the TTL and the SAME
@@ -993,6 +1213,21 @@ class TestEviction:
         assert "_marker" not in pipe._state["485020"]
         # And _last_seen reflects the new timestamp
         assert pipe._state["485020"]["_last_seen"] == 100.0
+
+    def test_throttled_sweep_does_not_extend_state_ttl(self):
+        # The global sweep at 299.9 schedules the next sweep for 300.9.
+        # Even so, state that expires at t=300 must not influence the
+        # same ICAO's ambiguous Comm-B decode at t=300.5.
+        pipe = PipeDecoder(eviction_ttl=300.0, eviction_interval=1.0)
+        pipe._state["4243D0"] = {"heading": 359.0, "_last_seen": 0.0}
+
+        pipe.decode("8D406B902015A678D4D220AA4BDA", timestamp=299.9)
+        result = pipe.decode("A000029CFFBAA11E2004727281F1", timestamp=300.5)
+
+        # Stale heading would incorrectly score BDS 6,0 ahead of the
+        # stateless BDS 5,0 winner.
+        assert result.get("bds") == "5,0"
+        assert "heading" not in pipe._state["4243D0"]
 
 
 class TestPositionMotionConsistency:
@@ -1049,8 +1284,16 @@ class TestPositionMotionConsistency:
         # Pair was resolved but rejected — lat/lon must be absent or None
         assert r.get("latitude") in (None, 0, False) or r["latitude"] is None
         assert pipe.stats["position_rejected"] == 1
-        # Ring buffer still updated with the rejected position
-        assert len(pipe._position_history[self.ICAO]) == 3
+        assert len(pipe._position_history[self.ICAO]) == 2
+
+        # Repeating the same CPR pair must not be accepted because the first
+        # rejected position was not added to trusted history.
+        pipe.decode("8D40058B58C901375147EFD09357", timestamp=1002.0)
+        repeated = pipe.decode("8D40058B58C904A87F402D3B8C59", timestamp=1003.0)
+        assert repeated.get("latitude") is None
+        assert repeated.get("longitude") is None
+        assert pipe.stats["position_rejected"] == 2
+        assert len(pipe._position_history[self.ICAO]) == 2
 
     def test_eviction_prunes_old_position_history(self):
         pipe = PipeDecoder(eviction_ttl=10.0)
@@ -1066,8 +1309,10 @@ class TestPositionMotionConsistency:
     def test_reset_clears_position_history(self):
         pipe = PipeDecoder()
         pipe._position_history[self.ICAO] = [(49.81, 6.08, 1000.0)]
+        pipe._airborne_position_reference[self.ICAO] = (49.81, 6.08, 1000.0)
         pipe.reset()
         assert pipe._position_history == {}
+        assert pipe._airborne_position_reference == {}
 
     def test_max_speed_configurable(self):
         # Tight max_speed — a 10 NM jump in 1 s should be rejected
@@ -1083,8 +1328,8 @@ class TestPositionMotionConsistency:
 
 class TestPositionBootstrap:
     ICAO = "40058B"
-    # A set of K=5 mutually-consistent positions walking near Amsterdam
-    # (aircraft cruising at ~500 kt).
+    # Five mutually-consistent positions walking near Amsterdam at a speed
+    # representative of a cruising aircraft.
     GOOD_CLUSTER: ClassVar[list[tuple[float, float, float]]] = [
         (52.30, 4.76, 1000.0),
         (52.31, 4.77, 1001.0),
@@ -1093,30 +1338,29 @@ class TestPositionBootstrap:
         (52.34, 4.82, 1004.0),
     ]
 
-    def test_hold_until_bootstrap_k_reached(self):
-        """First K-1 pairs hold lat/lon in the bootstrap buffer; the
-        result's `latitude` is None and the stat increments."""
-        from pyModeS._pipe import _BOOTSTRAP_K
+    def test_hold_until_bootstrap_majority_reached(self):
+        """Two candidates remain held until a 3-member majority exists."""
+        from pyModeS._pipe import _BOOTSTRAP_MIN_CLUSTER_SIZE
 
         pipe = PipeDecoder()
-        for _i, (lat, lon, t) in enumerate(self.GOOD_CLUSTER[: _BOOTSTRAP_K - 1]):
+        held = _BOOTSTRAP_MIN_CLUSTER_SIZE - 1
+        for lat, lon, t in self.GOOD_CLUSTER[:held]:
             pipe._bootstrap_accumulate({}, self.ICAO, lat, lon, t)
         # Still held — no history yet
         assert self.ICAO not in pipe._position_history
-        assert len(pipe._bootstrap[self.ICAO]) == _BOOTSTRAP_K - 1
-        assert pipe.stats["bootstrap_held"] == _BOOTSTRAP_K - 1
+        assert len(pipe._bootstrap[self.ICAO]) == held
+        assert pipe.stats["bootstrap_held"] == held
 
-    def test_cluster_locks_on_kth_consistent_candidate(self):
-        """When K mutually-consistent candidates accumulate, cluster
+    def test_cluster_locks_on_third_consistent_candidate(self):
+        """When three mutually-consistent candidates accumulate, cluster
         analysis promotes them all into _position_history and clears
         the bootstrap buffer."""
         pipe = PipeDecoder()
-        for lat, lon, t in self.GOOD_CLUSTER:
+        for lat, lon, t in self.GOOD_CLUSTER[:3]:
             pipe._bootstrap_accumulate({}, self.ICAO, lat, lon, t)
         assert self.ICAO in pipe._position_history
         assert self.ICAO not in pipe._bootstrap
-        # All five candidates were consistent → all kept (up to ring size).
-        assert len(pipe._position_history[self.ICAO]) == 5
+        assert len(pipe._position_history[self.ICAO]) == 3
         assert pipe.stats["bootstrap_reset"] == 0
 
     def test_bootstrap_picks_majority_cluster(self):
@@ -1127,7 +1371,8 @@ class TestPositionBootstrap:
         reals = self.GOOD_CLUSTER[:3]
         # 2 phantoms scattered across the world
         phantoms = [(70.0, -40.0, 999.5), (-30.0, 120.0, 1001.5)]
-        for lat, lon, t in reals + phantoms:
+        mixed = [reals[0], phantoms[0], reals[1], phantoms[1], reals[2]]
+        for lat, lon, t in mixed:
             pipe._bootstrap_accumulate({}, self.ICAO, lat, lon, t)
         # Locked on the reals
         assert self.ICAO in pipe._position_history
@@ -1136,6 +1381,19 @@ class TestPositionBootstrap:
         for lat, lon, _ in hist:
             assert 50 < lat < 55
             assert 0 < lon < 10
+
+    def test_bootstrap_requires_every_cluster_pair_to_be_consistent(self):
+        """A central point must not join two mutually-inconsistent points."""
+        pipe = PipeDecoder(max_speed_kt=0.0, motion_margin_km=2.0)
+
+        # At the equator, 0.015 degrees longitude is about 1.67 km. The
+        # centre is within the 2 km margin of both endpoints, while the
+        # endpoints are about 3.34 km apart.
+        for lon in (0.0, 0.015, 0.03):
+            pipe._bootstrap_accumulate({}, self.ICAO, 0.0, lon, 1000.0)
+
+        assert self.ICAO not in pipe._position_history
+        assert len(pipe._bootstrap[self.ICAO]) == 3
 
     def test_bootstrap_resets_when_all_phantoms(self):
         """All K candidates are mutually inconsistent (random scatter) —
@@ -1157,26 +1415,46 @@ class TestPositionBootstrap:
         assert pipe._bootstrap[self.ICAO] == []
         assert pipe.stats["bootstrap_reset"] == 1
 
-    def test_end_to_end_lock_after_five_real_pairs(self):
+    def test_end_to_end_lock_after_three_real_pairs(self):
         """Integration through the real pair-decode path.
 
-        The first 5 pairs are held during bootstrap; when the 5th
-        arrives, cluster analysis picks the consistent group and
-        retroactively fills in ``latitude``/``longitude`` on the
-        earlier result dicts. The 6th pair is emitted through the
-        normal motion-consistency check.
+        The first three pairs are held during bootstrap. The third completes
+        the consistent cluster and retroactively fills the earlier results.
+        The fourth pair follows the steady-state validation path.
         """
         pipe = PipeDecoder()
         results = []
-        for i in range(6):
+        for i in range(4):
             pipe.decode("8D40058B58C901375147EFD09357", timestamp=1000.0 + 2 * i)
             r = pipe.decode("8D40058B58C904A87F402D3B8C59", timestamp=1001.0 + 2 * i)
             results.append(r)
-        # All six now have lat/lon — the first five via retro-fill on
-        # lock, the sixth via the steady-state motion-consistency check.
+        # The first three results are retro-filled during promotion; the
+        # fourth is emitted after the normal motion-consistency check.
         for r in results:
             assert r["latitude"] == pytest.approx(49.81755, abs=0.001)
             assert r["longitude"] == pytest.approx(6.08442, abs=0.001)
+
+    def test_flush_initializes_airborne_reference_for_continued_decoding(self):
+        pipe = PipeDecoder()
+        for i in range(2):
+            pipe.decode(
+                "8D40058B58C901375147EFD09357",
+                timestamp=1000.0 + 2 * i,
+            )
+            pipe.decode(
+                "8D40058B58C904A87F402D3B8C59",
+                timestamp=1001.0 + 2 * i,
+            )
+
+        pipe.flush()
+
+        assert "40058B" in pipe._airborne_position_reference
+        result = pipe.decode(
+            "8D40058B58C901375147EFD09357",
+            timestamp=1004.0,
+        )
+        assert result["latitude"] == pytest.approx(49.82410, abs=0.001)
+        assert result["longitude"] == pytest.approx(6.06785, abs=0.001)
 
     def test_bootstrap_eviction_clears_stale_candidates(self):
         pipe = PipeDecoder(eviction_ttl=10.0)

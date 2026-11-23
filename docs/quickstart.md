@@ -66,6 +66,7 @@ so the output list length always matches the input length.
 `PipeDecoder` holds per-ICAO state across calls. This lets it:
 
 - Resolve CPR pairs from consecutive even/odd frames
+- Resolve later airborne frames locally from the last validated position
 - Disambiguate BDS 5,0/6,0 Comm-B using recently-observed state
 - Verify DF20/21 ICAO addresses against ones learned from DF17/18
 
@@ -75,11 +76,15 @@ from pyModeS import PipeDecoder
 pipe = PipeDecoder(surface_ref="EHAM")
 for msg, timestamp in stream:
     decoded = pipe.decode(msg, timestamp=timestamp)
-    if "latitude" in decoded:
+    if decoded.get("latitude") is not None:
         print(decoded["icao"], decoded["latitude"], decoded["longitude"])
 
 print(pipe.stats)  # {'total': ..., 'decoded': ..., 'crc_fail': ..., 'pending_pairs': ...}
 ```
+
+`surface_ref` is optional and applies only to surface-position messages.
+Airborne local CPR references are learned automatically from validated global
+pairs and never use the surface reference.
 
 See the [PipeDecoder deep-dive](pipe.md) for the full state model.
 
@@ -133,6 +138,13 @@ cprNL(52.0)   # 36
 cprNL(0.0)    # 59
 ```
 
+`crc_valid` is a boolean when the parity can be checked independently:
+DF17/18 carry plain ICAO addresses, while address-parity formats require an
+`icao=` hint. Without that independent address, DF0/4/5/11/16/20/21 return
+`crc_valid=None`; deriving an ICAO and then checking it against the same parity
+remainder would be circular. `PipeDecoder` reports its separate address trust
+decision through `icao_verified`.
+
 These are thin wrappers around `pyModeS._bits`, `_altcode`,
 `_idcode`, and `position._cpr` — changing the primitives auto-
 flows through. Importing from `pyModeS.common` (the v2 location)
@@ -146,6 +158,27 @@ For pandas / parquet workflows that need uniform column shapes:
 result = pyModeS.decode("8D406B902015A678D4D220AA4BDA", full_dict=True)
 # Result contains all ~123 schema keys; missing values default to None
 ```
+
+## Meteorological Comm-B reports
+
+BDS 4,4 routine meteorological reports and BDS 4,5 hazard reports use
+heuristic inference and are disabled by default because their payload patterns
+can overlap other Comm-B registers. Enable them only for feeds where these
+reports are expected:
+
+```python
+result = pyModeS.decode(
+    "A0001692185BD5CF400000DFC696",
+    include_meteo=True,
+)
+assert result["bds"] == "4,4"
+print(result["wind_speed"], result["wind_direction"])
+
+pipe = pyModeS.PipeDecoder(include_meteo=True)
+```
+
+When several formats remain plausible, inspect `bds_candidates`; `bds` is the
+decoder's preferred candidate.
 
 ## Error handling
 
@@ -179,7 +212,7 @@ console script when you run `pip install pyModeS`.
 ### `modes decode`
 
 ```
-modes decode [--compact] [--full-dict] [--surface-ref REF]
+modes decode [--compact] [--full-dict] [--include-meteo] [--surface-ref REF]
              (MESSAGE [--reference LAT LON] | --file PATH)
 ```
 
@@ -203,6 +236,7 @@ Flags:
 - `--compact` — emit one-line JSON instead of pretty-printed. In
   batch shapes this yields one JSON line per message (JSONL).
 - `--full-dict` — populate every key in the canonical schema
+- `--include-meteo` — include heuristic Comm-B BDS 4,4/4,5 inference
 - `--reference LAT LON` — airborne CPR reference (only valid with
   a single positional MESSAGE — not with `--file` or comma-batch,
   since one reference cannot apply to multiple aircraft)
@@ -240,13 +274,14 @@ cat flight.log | modes decode --file -
 ```
 modes live --network HOST:PORT [--surface-ref REF]
                                [--full-dict]
+                               [--include-meteo]
                                [--dump-to FILE]
                                [--tui]
                                [--quiet]
 ```
 
-Opens a TCP connection to a Mode-S Beast binary feed (dump1090's
-default port 30005, dump1090-fa, readsb, piaware, AirSquitter) and
+Opens a TCP connection to a Mode-S Beast binary feed (dump1090,
+dump1090-fa, readsb, piaware, AirSquitter) and
 emits decoded JSON lines to stdout as they arrive. Legacy AVR raw
 text format is not supported in v3.
 
@@ -256,6 +291,7 @@ Flags:
 - `--surface-ref REF` — forwarded to the internal `PipeDecoder`
   for surface CPR resolution
 - `--full-dict` — emit every schema key per line
+- `--include-meteo` — include heuristic Comm-B BDS 4,4/4,5 inference
 - `--dump-to FILE` — tee JSON lines to a file in addition to
   stdout (incompatible with `--tui`)
 - `--tui` — interactive live aircraft table (requires
@@ -267,17 +303,14 @@ Examples:
 
 ```sh
 # Basic streaming to stdout
-modes live --network localhost:30005
-
-# Public test feed over Europe (TU Delft)
-modes live --network airsquitter.lr.tudelft.nl:10006
+modes live --network localhost:10006
 
 # Tee to a file for later analysis
-modes live --network host:30005 --dump-to flight.jsonl
+modes live --network host:10006 --dump-to flight.jsonl
 
 # Interactive TUI
 pip install "pyModeS[tui]"
-modes live --network host:30005 --tui
+modes live --network host:10006 --tui
 ```
 
 Signal handling: Ctrl-C (SIGINT) and SIGTERM trigger a clean

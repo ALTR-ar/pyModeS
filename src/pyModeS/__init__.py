@@ -18,9 +18,13 @@ and are NOT interchangeable:
   45 NM of the true position — tighter than the airborne tolerance.
 
 For streaming workflows where references aren't known ahead of time,
-use :class:`PipeDecoder` which resolves airborne positions from
-even/odd CPR pairs without any reference and still accepts
-``surface_ref`` for surface messages.
+use :class:`PipeDecoder`. It establishes airborne positions from even/odd CPR
+pairs, then resolves later frames locally from the last validated airborne
+position. The optional ``surface_ref`` applies only to surface messages.
+
+Comm-B BDS 4,4/4,5 meteorological inference is heuristic and disabled by
+default. Pass ``include_meteo=True`` to :func:`decode` or
+:class:`PipeDecoder` when these reports are expected on the input feed.
 """
 
 from importlib.metadata import version as _version

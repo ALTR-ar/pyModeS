@@ -37,6 +37,8 @@ class TestDecodeSubcommand:
         assert args.file is None
         assert args.compact is False
         assert args.full_dict is False
+        assert args.include_meteo is False
+        assert args.uplink is False
         assert args.reference is None
         assert args.surface_ref is None
 
@@ -67,6 +69,13 @@ class TestDecodeSubcommand:
         )
         assert args.full_dict is True
 
+    def test_decode_include_meteo_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["decode", "A0001692185BD5CF400000DFC696", "--include-meteo"]
+        )
+        assert args.include_meteo is True
+
     def test_decode_with_file(self):
         parser = build_parser()
         args = parser.parse_args(["decode", "--file", "input.log"])
@@ -92,6 +101,18 @@ class TestDecodeSubcommand:
         )
         assert args.surface_ref == "LFBO"
 
+    @pytest.mark.parametrize("value", ["bad,coord", "91,0", "0,181", "nan,0"])
+    def test_decode_invalid_surface_ref_errors(self, value):
+        from pyModeS.cli._args import validate_args
+
+        parser = build_parser()
+        args = parser.parse_args(
+            ["decode", "903a23ff426a4e65f7487a775d17", "--surface-ref", value]
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            validate_args(args, parser)
+        assert excinfo.value.code == 2
+
 
 class TestLiveSubcommand:
     def test_live_help_exits_zero(self):
@@ -116,6 +137,20 @@ class TestLiveSubcommand:
         assert args.dump_to is None
         assert args.surface_ref is None
         assert args.full_dict is False
+        assert args.include_meteo is False
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["missing-port", ":10006", "host:0", "host:65536", "host:not-a-port"],
+    )
+    def test_invalid_network_endpoint_errors(self, endpoint):
+        from pyModeS.cli._args import validate_args
+
+        parser = build_parser()
+        args = parser.parse_args(["live", "--network", endpoint])
+        with pytest.raises(SystemExit) as excinfo:
+            validate_args(args, parser)
+        assert excinfo.value.code == 2
 
     def test_live_all_flags(self):
         parser = build_parser()
@@ -127,6 +162,7 @@ class TestLiveSubcommand:
                 "--surface-ref",
                 "EHAM",
                 "--full-dict",
+                "--include-meteo",
                 "--dump-to",
                 "out.jsonl",
             ]
@@ -134,6 +170,7 @@ class TestLiveSubcommand:
         assert args.network == "host.example:10003"
         assert args.surface_ref == "EHAM"
         assert args.full_dict is True
+        assert args.include_meteo is True
         assert args.dump_to == "out.jsonl"
 
     def test_live_tui_with_dump_to_errors(self):

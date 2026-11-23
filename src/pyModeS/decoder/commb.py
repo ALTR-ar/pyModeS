@@ -70,7 +70,12 @@ _FLIGHT_STATUS_TEXT = {
 class CommB(DecoderBase):
     """Decoder for DF20 Comm-B altitude replies and DF21 Comm-B identity replies."""
 
-    def decode(self, *, known: dict[str, Any] | None = None) -> Decoded:
+    def decode(
+        self,
+        *,
+        known: dict[str, Any] | None = None,
+        include_meteo: bool = False,
+    ) -> Decoded:
         result: Decoded = Decoded()
 
         # Header field: altitude for DF20, squawk for DF21.
@@ -91,7 +96,7 @@ class CommB(DecoderBase):
         # disambiguation of BDS 5,0 / 6,0 when the caller supplies
         # aircraft state.
         candidates = _infer.infer(
-            self._payload, self._df, include_meteo=False, known=known
+            self._payload, self._df, include_meteo=include_meteo, known=known
         )
         if not candidates:
             return result
